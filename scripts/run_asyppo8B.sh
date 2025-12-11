@@ -161,12 +161,12 @@ MISC_ARGS=(
    # --use-hf-config-for-megatron
 )
 
-# CUSTOM_ARGS=(
-#    --log-position-value-stats
-#    --max-log-positions 500
-#    --lambd-actor 0.95
-#    --lambd-critic 0.95
-# )
+CUSTOM_ARGS=(
+   --log-position-value-stats
+   --max-log-positions 500
+   --lambd-actor 0.95
+   --lambd-critic 0.95
+)
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}

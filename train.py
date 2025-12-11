@@ -11,7 +11,7 @@ from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger
 from slime.utils.misc import should_run_periodic_action
 from slime.utils.tracking_utils import init_tracking
-
+from slime.utils.add_my_custom_arguments import add_my_custom_arguments
 
 def train(args):
     configure_logger()
@@ -102,5 +102,5 @@ def train(args):
 
 
 if __name__ == "__main__":
-    args = parse_args()
+    args = parse_args(add_custom_arguments=add_my_custom_arguments)
     train(args)
