@@ -74,8 +74,8 @@ EVAL_ARGS=(
    --eval-prompt-data aime2425 /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/AsyPPO/test.jsonl
    --n-samples-per-eval-prompt 16
    --eval-max-response-len 10240
-   --eval-top-p 0.7
-   --eval-temperature 0.8
+   --eval-top-p 0.95
+   --eval-temperature 0.6
    --log-passrate
 )
 

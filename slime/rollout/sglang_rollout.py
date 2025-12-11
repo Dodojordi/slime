@@ -123,7 +123,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         "sampling_params": sampling_params,
         "return_logprob": True,
     }
-
+    # logger.info(f"Actual sampling_params sent to sglang: {sampling_params}")
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
 
