@@ -380,6 +380,10 @@ async def generate_rollout_async(
             # NOTE: here we have not stored all the unused samples back to the data buffer.
             if len(data) < target_data_size:
                 data.append(group)
+                # for _sample in group:
+                #     logger.info(
+                #         f"加入的数据: {[str(_sample.prompt) + _sample.response]}, label: {_sample.label}, reward: {_sample.reward}"
+                #     )
                 pbar.update(args.n_samples_per_prompt)
 
     pbar.close()
@@ -517,17 +521,18 @@ async def eval_rollout_single_dataset(
             )
 
     data = []
-    do_print = True
-    pbar = tqdm(total=len(tasks), desc="Rollout generation", disable=not do_print)
+    print_count = 10  # 多打印几个 sample
+    printed = 0
+    pbar = tqdm(total=len(tasks), desc="Rollout generation", disable=False)
     for coro in asyncio.as_completed(tasks):
         sample = await coro
-        if do_print:
+        if printed < print_count:
             logger.info(
                 "eval_rollout_single_dataset example data: "
                 f"{[str(sample.prompt) + sample.response]} "
                 f"reward={sample.reward}"
             )
-            do_print = False
+            printed += 1
         if isinstance(sample, list):
             data.extend(sample)
         else:
