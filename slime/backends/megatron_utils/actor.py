@@ -53,6 +53,29 @@ class MegatronTrainRayActor(TrainRayActor):
         monkey_patch_torch_dist()
 
         super().init(args, role, with_ref)
+        
+        # === 新增：如果是 critic 且使用不同模型，重新应用 HF config ===
+        if (
+            role == "critic"
+            and hasattr(args, 'critic_hf_checkpoint')
+            and args.critic_hf_checkpoint != args.hf_checkpoint
+            and hasattr(args, "use_hf_config_for_megatron")
+            and args.use_hf_config_for_megatron
+        ):
+            logger.info(f"Reapplying HF config for critic from {args.critic_hf_checkpoint} to {args.hf_checkpoint}")
+            from slime.backends.megatron_utils.config_mapping import get_mapper
+            
+            critic_hf_config = AutoConfig.from_pretrained(args.critic_hf_checkpoint, trust_remote_code=True)
+            if args.use_hf_config_for_megatron:
+                megatron_config_from_hf = get_mapper(critic_hf_config.model_type)(critic_hf_config)
+                # 覆盖模型架构参数
+                for key, value in megatron_config_from_hf.transformer_config.items():
+                    setattr(args, key, value)
+                for key, value in megatron_config_from_hf.gpt_model_args.items():
+                    setattr(args, key, value)
+            # 更新 hf_checkpoint 指向 critic 的
+            args.hf_checkpoint = args.critic_hf_checkpoint
+        # === 新增结束 ===
 
         init(args)
 
@@ -76,10 +99,43 @@ class MegatronTrainRayActor(TrainRayActor):
             return 0
 
         if role == "critic":
-            self.args.load = self.args.critic_load
+            self.args.load = self.args.critic_ref_load
             self.args.save = self.args.critic_save
             self.args.lr = self.args.critic_lr
             self.args.lr_warmup_iters = self.args.critic_lr_warmup_iters
+            if hasattr(args, 'use_asyppo') and args.use_asyppo:
+                # 检查 critic_load 是否为有效的 Megatron checkpoint
+                critic_load_valid = (
+                    self.args.critic_load is not None
+                    and os.path.exists(self.args.critic_load)
+                    and os.path.exists(os.path.join(self.args.critic_load, "latest_checkpointed_iteration.txt"))
+                )
+                
+                if not critic_load_valid:
+                    # critic_load 无效，尝试回退
+                    if hasattr(args, 'critic_ref_load') and args.critic_ref_load:
+                        logger.info(
+                            f"critic_load '{self.args.critic_load}' is not a valid Megatron checkpoint. "
+                            f"Falling back to critic_ref_load: {args.critic_ref_load}"
+                        )
+                        self.args.load = args.critic_ref_load
+                        self.args.no_load_optim = True
+                        self.args.no_load_rng = True
+                        self.args.finetune = True
+                    else:
+                        # 如果没有 critic_ref_load，回退到普通的 ref_load
+                        logger.warning(
+                            f"critic_load '{self.args.critic_load}' is not valid and no critic_ref_load specified. "
+                            f"Falling back to ref_load: {args.ref_load}"
+                        )
+                        self.args.load = args.ref_load
+                        self.args.no_load_optim = True
+                        self.args.no_load_rng = True
+                        self.args.finetune = True
+                else:
+                    # critic_load 有效，直接使用
+                    logger.info(f"Loading critic from valid checkpoint: {self.args.critic_load}")
+                    self.args.load = self.args.critic_load
 
         (self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id) = initialize_model_and_optimizer(
             args, role
@@ -334,21 +390,154 @@ class MegatronTrainRayActor(TrainRayActor):
                 num_microbatches,
             )
         )
-
+        
+        # ============ 新增：统计position-value关系 ============
+        # if getattr(self.args, 'log_position_value_stats', False) and "values" in rollout_data:
+        #     # 只在最后一个pipeline stage记录（与model.py中的logging保持一致）
+        #     if (
+        #         mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+        #         and mpu.get_tensor_model_parallel_rank() == 0
+        #         and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
+        #     ):
+        #         import numpy as np
+        #         from slime.utils import tracking_utils
+                
+        #         # 计算训练步数（与model.py中保持一致）
+        #         num_steps_per_rollout = len(num_microbatches)
+        #         # 这里用rollout的起始step_id，即rollout_id * num_steps_per_rollout
+        #         accumulated_step_id = rollout_id * num_steps_per_rollout
+                
+        #         # 统计每个position的value
+        #         position_value_stats = {}  # {position: list of values}
+                
+        #         for values_tensor in rollout_data["values"]:
+        #             # values_tensor 的形状是 [response_length]
+        #             for pos, val in enumerate(values_tensor.tolist()):
+        #                 if pos not in position_value_stats:
+        #                     position_value_stats[pos] = []
+        #                 position_value_stats[pos].append(val)
+                
+        #         # 计算每个position的平均value并记录
+        #         log_dict = {}
+        #         max_position = max(position_value_stats.keys()) if position_value_stats else 0
+                
+        #         max_log_positions = getattr(self.args, 'max_log_positions', 50)
+        #         for pos in sorted(position_value_stats.keys())[:max_log_positions]:
+        #             vals = np.array(position_value_stats[pos])
+        #             # 只记录平均值
+        #             log_dict[f"critic/value_pos_{pos}_mean"] = float(vals.mean())
+                    
+        #             # 可选：如果需要更多统计信息，可以取消下面的注释
+        #             # log_dict[f"critic/value_pos_{pos}_std"] = float(vals.std())
+        #             # log_dict[f"critic/value_pos_{pos}_count"] = len(vals)
+                
+        #         # 额外记录一些元信息
+        #         log_dict["critic/max_position"] = max_position
+        #         log_dict["critic/num_samples"] = len(rollout_data["values"])
+        #         log_dict["train/step"] = accumulated_step_id
+                
+        #         # 使用tracking_utils记录
+        #         tracking_utils.log(self.args, log_dict, step_key="train/step")
+                
+        #         # 格式化输出position-value统计信息
+        #         position_stats_str = ", ".join([
+        #             f"pos_{pos}={log_dict[f'critic/value_pos_{pos}_mean']:.4f}" 
+        #             for pos in sorted(position_value_stats.keys())[:max_log_positions]
+        #         ])
+        #         logger.info(f"Position-Value Stats at step {accumulated_step_id}: "
+        #                 f"max_pos={max_position}, num_samples={len(rollout_data['values'])}")
+        #         logger.info(f"Position-wise mean values: {position_stats_str}")
+        
+        if getattr(self.args, 'log_position_value_stats', False) and "values" in rollout_data:
+            # 只在最后一个pipeline stage记录（与model.py中的logging保持一致）
+            if (
+                mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+                and mpu.get_tensor_model_parallel_rank() == 0
+                and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
+            ):
+                import numpy as np
+                from slime.utils import tracking_utils
+                from torch.nn.utils.rnn import pad_sequence
+                
+                # 计算训练步数（与model.py中保持一致）
+                num_steps_per_rollout = len(num_microbatches)
+                # 这里用rollout的起始step_id，即rollout_id * num_steps_per_rollout
+                accumulated_step_id = rollout_id * num_steps_per_rollout
+                
+                # 使用 tensor 操作批量计算每个位置的均值
+                # 1. Pad 到最大长度以便批量计算
+                padded_values = pad_sequence(rollout_data["values"], batch_first=True, padding_value=float('nan'))  # [B, MaxLen]
+                
+                # 2. 计算最大位置（用于元信息记录）
+                max_position = padded_values.shape[1] - 1 if padded_values.shape[1] > 0 else 0
+                
+                # 3. 只处理前 max_log_positions 个位置
+                max_log_positions = getattr(self.args, 'max_log_positions', 50)
+                target_len = min(padded_values.shape[1], max_log_positions)
+                sliced_values = padded_values[:, :target_len]  # [B, target_len]
+                
+                # 4. 批量计算每个位置的均值（忽略 padding 的 nan）
+                means = torch.nanmean(sliced_values, dim=0)  # [target_len]
+                
+                # 5. 构建 log_dict（保持原有格式）
+                log_dict = {}
+                # 只记录有有效数据的位置（非 nan 的位置）
+                valid_positions = []
+                for pos in range(target_len):
+                    mean_val = float(means[pos].item())
+                    if not torch.isnan(means[pos]):
+                        log_dict[f"critic/value_pos_{pos}_mean"] = mean_val
+                        valid_positions.append(pos)
+                
+                # 额外记录一些元信息（保持原有格式）
+                log_dict["critic/max_position"] = max_position
+                log_dict["critic/num_samples"] = len(rollout_data["values"])
+                log_dict["train/step"] = accumulated_step_id
+                
+                # 使用tracking_utils记录
+                tracking_utils.log(self.args, log_dict, step_key="train/step")
+                
+                # 格式化输出position-value统计信息（保持原有格式）
+                position_stats_str = ", ".join([
+                    f"pos_{pos}={log_dict[f'critic/value_pos_{pos}_mean']:.4f}" 
+                    for pos in valid_positions
+                ])
+                logger.info(f"Position-Value Stats at step {accumulated_step_id}: "
+                        f"max_pos={max_position}, num_samples={len(rollout_data['values'])}")
+                logger.info(f"Position-wise mean values: {position_stats_str}")
+        
+        # ============ 结束：统计position-value关系 ============
         if rollout_id >= self.args.num_critic_only_steps:
             sync_actor_critic_data(self.args, rollout_data, self._actor_critic_groups)
-
+        # sync_actor_critic_data(self.args, rollout_data, self._actor_critic_groups)
         compute_advantages_and_returns(self.args, rollout_data)
 
         self.args.loss_type = "value_loss"
-        train(
-            rollout_id,
-            self.model,
-            self.optimizer,
-            self.opt_param_scheduler,
-            data_iterator,
-            num_microbatches,
-        )
+        # train(
+        #     rollout_id,
+        #     self.model,
+        #     self.optimizer,
+        #     self.opt_param_scheduler,
+        #     data_iterator,
+        #     num_microbatches,
+        # )
+        with timer("critic_train"):
+            train(
+                rollout_id,
+                self.model,
+                self.optimizer,
+                self.opt_param_scheduler,
+                data_iterator,
+                num_microbatches,
+            )
+        # --- end 计时critic训练 ---
+
+        # 也做profiler记录
+        self.prof.step(rollout_id=rollout_id)
+
+        train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
+
+        log_perf_data(rollout_id, self.args)
 
     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
         # Create data iterator for log_probs and train.
@@ -399,6 +588,67 @@ class MegatronTrainRayActor(TrainRayActor):
                 # Calculate adv and returns. Need to performed before training (instead of on the fly),
                 # because we may need normalize the whole rollout.
                 compute_advantages_and_returns(self.args, rollout_data)
+
+                # ============ 新增：统计position-advantage关系 ============
+                if getattr(self.args, 'log_position_value_stats', False) and "advantages" in rollout_data:
+                    # 只在最后一个pipeline stage记录（与value统计保持一致）
+                    if (
+                        mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+                        and mpu.get_tensor_model_parallel_rank() == 0
+                        and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
+                    ):
+                        import numpy as np
+                        from slime.utils import tracking_utils
+                        from torch.nn.utils.rnn import pad_sequence
+
+                        # 计算训练步数（与value统计保持一致）
+                        num_steps_per_rollout = len(num_microbatches)
+                        accumulated_step_id = rollout_id * num_steps_per_rollout
+
+                        # 使用 tensor 操作批量计算每个位置的均值
+                        # 1. Pad 到最大长度以便批量计算
+                        padded_advantages = pad_sequence(rollout_data["advantages"], batch_first=True, padding_value=float('nan'))  # [B, MaxLen]
+
+                        # 2. 计算最大位置（用于元信息记录）
+                        max_position = padded_advantages.shape[1] - 1 if padded_advantages.shape[1] > 0 else 0
+
+                        # 3. 只处理前 max_log_positions 个位置
+                        max_log_positions = getattr(self.args, 'max_log_positions', 50)
+                        target_len = min(padded_advantages.shape[1], max_log_positions)
+                        sliced_advantages = padded_advantages[:, :target_len]  # [B, target_len]
+
+                        # 4. 批量计算每个位置的均值、标准差等统计信息（忽略 padding 的 nan）
+                        means = torch.from_numpy(np.nanmean(sliced_advantages.cpu().numpy(), axis=0))  # [target_len]
+                        stds = torch.from_numpy(np.nanstd(sliced_advantages.cpu().numpy(), axis=0))    # [target_len]
+
+                        # 5. 构建 log_dict
+                        log_dict = {}
+                        valid_positions = []
+                        for pos in range(target_len):
+                            mean_adv = float(means[pos].item())
+                            std_adv = float(stds[pos].item())
+                            if not np.isnan(means[pos].item()):
+                                log_dict[f"actor/advantage_pos_{pos}_mean"] = mean_adv
+                                log_dict[f"actor/advantage_pos_{pos}_std"] = std_adv
+                                valid_positions.append(pos)
+
+                        # 额外记录一些元信息
+                        log_dict["actor/advantage_max_position"] = max_position
+                        log_dict["actor/advantage_num_samples"] = len(rollout_data["advantages"])
+                        log_dict["train/step"] = accumulated_step_id
+
+                        # 使用tracking_utils记录
+                        tracking_utils.log(self.args, log_dict, step_key="train/step")
+
+                        # 格式化输出position-advantage统计信息
+                        position_stats_str = ", ".join([
+                            f"pos_{pos}=μ{log_dict[f'actor/advantage_pos_{pos}_mean']:.4f}±σ{log_dict[f'actor/advantage_pos_{pos}_std']:.4f}"
+                            for pos in valid_positions
+                        ])
+                        logger.info(f"Position-Advantage Stats at step {accumulated_step_id}: "
+                                    f"max_pos={max_position}, num_samples={len(rollout_data['advantages'])}")
+                        logger.info(f"Position-wise mean±std advantages: {position_stats_str}")
+                # ============ 结束：统计position-advantage关系 ============
 
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args)

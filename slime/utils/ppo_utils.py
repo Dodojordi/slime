@@ -2,12 +2,13 @@
 # and https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/trainer/ppo_utils/experience_maker.py
 
 from argparse import Namespace
-
+from typing import Callable, Optional
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import logging
 
-
+logger = logging.getLogger(__name__)
 @torch.compile(dynamic=True)
 def compute_approx_kl(
     log_probs: torch.Tensor,
@@ -312,7 +313,11 @@ def get_advantages_and_returns(
     values: torch.Tensor,
     rewards: torch.Tensor,
     gamma: float,
-    lambd: float,
+    # lambd: float,
+    lambd_actor: float,
+    lambd_critic: float,
+    alpha: float = 0.05,
+    use_adaptive_lambda: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Function that computes advantages and returns from rewards and values.
     Calculated as in the original PPO paper: https://arxiv.org/abs/1707.06347
@@ -334,6 +339,10 @@ def get_advantages_and_returns(
     - advantages: Tensor of shape (response_size,)
     - returns: Tensor of shape (response_size,)
     """
+    
+    if use_adaptive_lambda:
+        lambd_actor = compute_adaptive_lambda_policy(response_len, alpha)
+        
     from megatron.core import mpu
 
     cp_size = mpu.get_context_parallel_world_size()
@@ -346,16 +355,30 @@ def get_advantages_and_returns(
         full_rewards = rewards
         full_values = values
 
-    lastgaelam = 0
+# lastgaelam = 0
+    # 分别计算actor和critic的GAE
+    lastgaelam_actor = 0
+    lastgaelam_critic = 0
     advantages_reversed = []
+    returns_reversed = []
+    
 
     for t in reversed(range(response_len)):
         nextvalues = full_values[t + 1] if t < response_len - 1 else 0.0
         delta = full_rewards[t] + gamma * nextvalues - full_values[t]
-        lastgaelam = delta + gamma * lambd * lastgaelam
-        advantages_reversed.append(lastgaelam)
+        # lastgaelam = delta + gamma * lambd * lastgaelam
+        # advantages_reversed.append(lastgaelam)
+        # Actor的advantage计算
+        lastgaelam_actor = delta + gamma * lambd_actor * lastgaelam_actor
+        advantages_reversed.append(lastgaelam_actor)
+        # Critic的advantage计算
+        lastgaelam_critic = delta + gamma * lambd_critic * lastgaelam_critic
+        returns_reversed.append(lastgaelam_critic+full_values[t])
+        
+        
     full_advantages = torch.tensor(advantages_reversed[::-1], dtype=full_values.dtype, device=full_values.device)
-    full_returns = full_advantages + full_values
+    # full_returns = full_advantages + full_values
+    full_returns = torch.tensor(returns_reversed[::-1], dtype=full_values.dtype, device=full_values.device)
 
     if cp_size > 1:
         from slime.backends.megatron_utils.cp_utils import slice_log_prob_with_cp
@@ -368,6 +391,70 @@ def get_advantages_and_returns(
 
     return advantages.detach(), returns
 
+def compute_adaptive_lambda_policy(
+    response_lengths: int | list[int] | torch.Tensor,
+    alpha: float,
+) -> float | list[float] | torch.Tensor:
+    """
+    计算长度自适应的lambda_policy值。
+    
+    公式: λ_policy = 1 - 1/(alpha * l)
+    其中 l 是response的长度，alpha是常数参数。
+    
+    Args:
+        response_lengths: Response序列的长度，可以是单个int、int列表或Tensor
+        alpha: 常数参数，必须大于0
+    
+    Returns:
+        计算得到的lambda_policy值，类型与输入response_lengths相同
+        
+    Examples:
+        >>> compute_adaptive_lambda_policy(100, alpha=2.0)
+        0.995  # 1 - 1/(2.0 * 100) = 1 - 0.005 = 0.995
+        
+        >>> compute_adaptive_lambda_policy([50, 100, 200], alpha=1.0)
+        [0.98, 0.99, 0.995]
+    """
+    eps = 1e-6  # 增加一个小的epsilon防止除0
+    if alpha <= 0:
+        raise ValueError(f"alpha must be greater than 0, got {alpha}")
+    
+    def clamp_lambda(lam):
+        # 保证最终的lambda在[0.95,1]范围内
+        return max(0.95, min(1.0, lam))
+    
+    if isinstance(response_lengths, int):
+        # 单个长度
+        if response_lengths <= 0:
+            raise ValueError(f"response_length must be greater than 0, got {response_lengths}")
+        lam = 1.0 - 1.0 / (alpha * max(response_lengths, eps))
+        return clamp_lambda(lam)
+    
+    elif isinstance(response_lengths, list):
+        # 列表
+        result = []
+        for l in response_lengths:
+            if l > 0:
+                lam = 1.0 - 1.0 / (alpha * max(l, eps))
+                lam = clamp_lambda(lam)
+            else:
+                lam = 0.0
+            result.append(lam)
+        return result
+    
+    elif isinstance(response_lengths, torch.Tensor):
+        # Tensor
+        if response_lengths.dtype != torch.int64 and response_lengths.dtype != torch.int32:
+            response_lengths = response_lengths.to(torch.int64)
+        length_f = response_lengths.float().clamp(min=eps)
+        result = 1.0 - 1.0 / (alpha * length_f)
+        result = torch.where(response_lengths > 0, result, torch.zeros_like(result))
+        # 保证范围在[0.95,1]
+        result = torch.clamp(result, min=0.95, max=1.0)
+        return result
+    
+    else:
+        raise TypeError(f"Unsupported type for response_lengths: {type(response_lengths)}")
 
 def get_advantages_and_returns_batch(
     total_lengths,
@@ -375,7 +462,10 @@ def get_advantages_and_returns_batch(
     values_list,
     rewards_list,
     gamma,
-    lambd,
+    lambd_actor,
+    lambd_critic,
+    use_adaptive_lambda: bool = False,
+    alpha: float = 0.05,
     chunked: bool = True,
 ):
     """
@@ -385,6 +475,8 @@ def get_advantages_and_returns_batch(
         response_lengths:  list[int], each sample's response_len
         values_list:       list[Tensor], each shape = [resp_len_i]
         rewards_list:      list[Tensor], same shape
+        use_adaptive_lambda: If True, compute adaptive lambda for each sample
+        alpha: Constant parameter for adaptive lambda
     Output:
         advantages_list:   list[Tensor], each shape = [resp_len_i]
         returns_list:      list[Tensor], same shape
@@ -396,6 +488,51 @@ def get_advantages_and_returns_batch(
         B = len(response_lengths)
         assert B == len(values_list)
         assert B == len(rewards_list)
+
+        # 如果启用自适应lambda，为每个样本计算lambda值
+        if use_adaptive_lambda:
+            lambd_actor_list = compute_adaptive_lambda_policy(response_lengths, alpha)
+            # Fix: Make lambd_critic_list a Python list (matching lambd_actor_list's structure)
+            lambd_critic_list = [lambd_critic] * len(lambd_actor_list)
+            logger.info(f"Adaptive lambda (lambd_actor) computed: {lambd_actor_list}")
+            logger.info(f"Adaptive lambda (lambd_critic) computed: {lambd_critic_list}")
+            
+            # 检查是否所有样本的lambda都相同
+            if len(set(lambd_actor_list)) > 1 or len(set(lambd_critic_list)) > 1:
+                # 每个样本的lambda不同，需要逐个处理，使用 get_advantages_and_returns
+                advantages_list = []
+                returns_list = []
+                
+                for i in range(B):
+                    total_len = total_lengths[i]
+                    resp_len = response_lengths[i]
+                    v = values_list[i]
+                    r = rewards_list[i]
+                    lambd_a = lambd_actor_list[i]
+                    lambd_c = lambd_critic_list[i]
+                    
+                    # 调用单个样本版本
+                    adv, ret = get_advantages_and_returns(
+                        total_len=total_len,
+                        response_len=resp_len,
+                        values=v,
+                        rewards=r,
+                        gamma=gamma,
+                        lambd_actor=lambd_a,
+                        lambd_critic=lambd_c,
+                        use_adaptive_lambda=False,  # 已经计算过了
+                        alpha=alpha,  # 虽然不会用到，但保持接口一致
+                    )
+                    advantages_list.append(adv)
+                    returns_list.append(ret)
+                
+                return advantages_list, returns_list
+            else:
+                # 所有样本的lambda相同，可以使用批量处理
+                lambd_actor = lambd_actor_list[0]
+                lambd_critic = lambd_critic_list[0]
+                logger.info(f"Adaptive lambda (lambd_actor) computed: {lambd_actor}")
+                logger.info(f"Adaptive lambda (lambd_critic) computed: {lambd_critic}")
 
         cp_size = mpu.get_context_parallel_world_size()
         device = values_list[0].device
@@ -415,7 +552,6 @@ def get_advantages_and_returns_batch(
                 full_values_list.append(full_v)
                 full_rewards_list.append(full_r)
 
-            # full_values_list[i].shape = [total_len_i]
         else:
             full_values_list = values_list
             full_rewards_list = rewards_list
@@ -436,14 +572,16 @@ def get_advantages_and_returns_batch(
                 rewards=full_rewards,
                 values=full_values,
                 gamma=gamma,
-                lambd=lambd,
+                lambd_actor=lambd_actor,
+                lambd_critic=lambd_critic,
             )
         else:
-            full_advantages, full_returns = chunked_gae(
+            full_advantages, full_returns = chunked_gae_dual_lambda(
                 rewards=full_rewards,
                 values=full_values,
                 gamma=gamma,
-                lambd=lambd,
+                lambd_actor=lambd_actor,
+                lambd_critic=lambd_critic,
             )
 
         advantages_list = []
@@ -459,7 +597,7 @@ def get_advantages_and_returns_batch(
                 full_returns,
                 strict=False,
             ):
-                adv_full = adv_row  # shape = [resp_len_i padded to max_len]
+                adv_full = adv_row
                 ret_full = ret_row
 
                 adv_sliced = slice_log_prob_with_cp(adv_full[:resp_len], total_len, resp_len)
@@ -481,23 +619,34 @@ def vanilla_gae(
     rewards: torch.Tensor,
     values: torch.Tensor,
     gamma: float,
-    lambd: float,
+    # lambd: float,
+    lambd_actor: float,
+    lambd_critic: float,
 ):
     B, T = rewards.shape
     device = rewards.device
     dtype = rewards.dtype
 
-    lastgaelam = torch.zeros(B, device=device, dtype=dtype)
+    # lastgaelam = torch.zeros(B, device=device, dtype=dtype)
+    lastgaelam_actor = torch.zeros(B, device=device, dtype=dtype)
+    lastgaelam_critic = torch.zeros(B, device=device, dtype=dtype)
     adv_rev = []
+    ret_rev = []
 
     for t in reversed(range(T)):
         next_value = values[:, t + 1] if t < T - 1 else 0.0
         delta = rewards[:, t] + gamma * next_value - values[:, t]
-        lastgaelam = delta + gamma * lambd * lastgaelam
-        adv_rev.append(lastgaelam)
+        # lastgaelam = delta + gamma * lambd * lastgaelam
+        # Actor advantages
+        lastgaelam_actor = delta + gamma * lambd_actor * lastgaelam_actor
+        adv_rev.append(lastgaelam_actor)
+        # Critic returns
+        lastgaelam_critic = delta + gamma * lambd_critic * lastgaelam_critic
+        ret_rev.append(lastgaelam_critic+values[:, t])
 
     full_advantages = torch.stack(adv_rev[::-1], dim=1)  # [B, max_len]
-    full_returns = full_advantages + values  # [B, max_len]
+    # full_returns = full_advantages + values  # [B, max_len]
+    full_returns = torch.stack(ret_rev[::-1], dim=1)  # [B, max_len]
     return full_advantages, full_returns
 
 
@@ -643,6 +792,114 @@ def chunked_gae(
 
     return advantages, returns
 
+def chunked_gae_dual_lambda(
+    rewards: torch.Tensor,
+    values: torch.Tensor,
+    gamma: float,
+    lambd_actor: float,
+    lambd_critic: float,
+    chunk_size: int = 128,
+):
+    """
+    使用分块并行计算的GAE，支持actor和critic使用不同的lambda
+    """
+    # 分别对actor和critic执行chunked_gae
+    advantages = chunked_gae_single_lambda(
+        rewards, values, gamma, lambd_actor, chunk_size
+    )
+    
+    returns_gae = chunked_gae_single_lambda(
+        rewards, values, gamma, lambd_critic, chunk_size
+    )
+    returns = returns_gae + values
+    
+    return advantages, returns
+
+
+def chunked_gae_single_lambda(
+    rewards: torch.Tensor,
+    values: torch.Tensor,
+    gamma: float,
+    lambd: float,
+    chunk_size: int = 128,
+):
+    """
+    单个lambda的chunked GAE计算（原chunked_gae的核心逻辑）
+    返回advantages（不包含values）
+    """
+    # 原来的chunked_gae实现，但只返回advantages部分
+    # ... 保持原有的chunk计算逻辑 ...
+    
+    assert rewards.ndim == 2 and values.ndim == 2
+    B, T = rewards.shape
+    device = rewards.device
+    dtype = rewards.dtype
+
+    next_values = torch.cat(
+        [values[:, 1:], torch.zeros(B, 1, device=device, dtype=dtype)],
+        dim=1,
+    )
+    deltas = rewards + gamma * next_values - values
+    w = gamma * lambd
+    deltas_rev = torch.flip(deltas, dims=[1])
+
+    # ... 原有的padding和chunk逻辑 ...
+    if T % chunk_size != 0:
+        pad = chunk_size - (T % chunk_size)
+        deltas_rev = F.pad(deltas_rev, (0, pad))
+    else:
+        pad = 0
+
+    B, T_pad = deltas_rev.shape
+    n_chunks = T_pad // chunk_size
+    deltas_chunks = deltas_rev.view(B, n_chunks, chunk_size)
+
+    idx = torch.arange(chunk_size, device=device)
+    row = idx[:, None]
+    col = idx[None, :]
+    diff = col - row
+
+    M = torch.zeros(chunk_size, chunk_size, device=device, dtype=dtype)
+    mask = diff >= 0
+
+    if w == 0.0:
+        M[mask & (diff == 0)] = 1.0
+    else:
+        M[mask] = w ** diff[mask].to(dtype)
+
+    if w == 0.0:
+        pow_vec = torch.zeros(chunk_size, device=device, dtype=dtype)
+    else:
+        pow_vec = w ** torch.arange(1, chunk_size + 1, device=device, dtype=dtype)
+
+    deltas_flat = deltas_chunks.reshape(B * n_chunks, chunk_size)
+    S_local_flat = deltas_flat @ M
+    S_local_chunks = S_local_flat.view(B, n_chunks, chunk_size)
+
+    lengths = [chunk_size] * n_chunks
+    if pad > 0:
+        lengths[-1] = chunk_size - pad
+
+    S_rev = deltas_rev.new_zeros(B, T_pad)
+    s_prev = torch.zeros(B, device=device, dtype=dtype)
+
+    for c in range(n_chunks):
+        Lc = lengths[c]
+        start = c * chunk_size
+        end = start + Lc
+
+        S_local = S_local_chunks[:, c, :Lc]
+        S_global = S_local + s_prev.unsqueeze(1) * pow_vec[:Lc]
+
+        S_rev[:, start:end] = S_global
+        s_prev = S_global[:, -1]
+
+    if pad > 0:
+        S_rev = S_rev[:, :T]
+
+    advantages = torch.flip(S_rev, dims=[1])
+    
+    return advantages
 
 def calculate_log_probs_and_entropy(logits, tokens, tp_group, with_entropy: bool = False):
     logits = logits.contiguous()
@@ -662,3 +919,68 @@ def calculate_log_probs_and_entropy(logits, tokens, tp_group, with_entropy: bool
     else:
         entropy = None
     return log_prob, entropy
+
+
+def compute_positive_nll_loss(
+    log_probs: torch.Tensor,
+    positive_nll_mask: list[torch.Tensor],
+    loss_masks: list[torch.Tensor],
+    response_lengths: list[int],
+    positive_reward_threshold: float = 0.0,  # 保留参数以保持兼容性，但不再使用
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Compute Negative Log-Likelihood (NLL) loss for positive samples (correct answers).
+    
+    Formula: LNLL(θ) = -1/P * Σ(oi∈T) Σ(t=1 to |oi|) log πθ(at|st)
+    where T is the set of correct answers, P is the total number of tokens in positive samples.
+    
+    Args:
+        log_probs: Concatenated log probabilities of all samples, shape [total_tokens]
+        positive_nll_mask: List of masks indicating which tokens should be used for NLL loss computation.
+                          Each mask is a tensor of shape [response_length] with 1 for positive tokens, 0 otherwise.
+        loss_masks: List of loss masks for each sample (used for validation, should match positive_nll_mask shape)
+        response_lengths: List of response lengths for each sample
+        positive_reward_threshold: Threshold to determine positive samples (deprecated, kept for compatibility)
+        sum_of_sample_mean: Function to compute mean over samples (unused, kept for API consistency)
+        
+    Returns:
+        Scalar tensor representing the NLL loss for positive samples
+    """
+    device = log_probs.device
+    dtype = log_probs.dtype
+    
+    # Split log_probs back into per-sample tensors
+    log_probs_per_sample = []
+    start_idx = 0
+    for resp_len in response_lengths:
+        end_idx = start_idx + resp_len
+        log_probs_per_sample.append(log_probs[start_idx:end_idx])
+        start_idx = end_idx
+    
+    # Collect log_probs for tokens marked as positive in positive_nll_mask
+    positive_log_probs_list = []
+    total_positive_tokens = 0
+    
+    for log_prob_sample, nll_mask in zip(log_probs_per_sample, positive_nll_mask, strict=False):
+        # Apply positive_nll_mask to get valid positive tokens
+        # positive_nll_mask already contains the information about which tokens are positive
+        masked_log_probs = log_prob_sample * nll_mask.float()
+        positive_log_probs_list.append(masked_log_probs)
+        
+        # Count valid positive tokens for normalization
+        num_valid_tokens = nll_mask.sum().item()
+        total_positive_tokens += num_valid_tokens
+    
+    # If no positive samples, return zero loss
+    if total_positive_tokens == 0 or len(positive_log_probs_list) == 0:
+        return torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True)
+    
+    # Concatenate all positive sample log_probs
+    all_positive_log_probs = torch.cat(positive_log_probs_list, dim=0)
+    
+    # Compute NLL loss: -1/P * Σ log πθ(at|st)
+    # Formula: LNLL(θ) = -mean(log_probs) = -sum(log_probs) / P
+    nll_loss = -all_positive_log_probs.sum() / total_positive_tokens
+    
+    return nll_loss

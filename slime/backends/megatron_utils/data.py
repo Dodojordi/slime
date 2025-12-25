@@ -318,6 +318,7 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                 "loss_masks",
                 "sample_indices",
                 "rollout_routed_experts",
+                "positive_nll_mask",
             ]:
                 continue
             # Upload per sample mean for each rollout value

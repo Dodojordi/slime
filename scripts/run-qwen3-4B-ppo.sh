@@ -24,32 +24,21 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "${SCRIPT_DIR}/models/qwen3-8B.sh"
+source "${SCRIPT_DIR}/models/qwen3-4B.sh"
 
 CKPT_ARGS=(
-   # --hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-8B-Base
-   # --ref-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/models/Qwen3-8B-Base-torch_dist
-   # --load /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-8B-Base
-   # --save /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-8B-Base-slime_PPO/
-   # --hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-4B-Base
-   # --ref-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/models/Qwen3-4B-Base-torch_dist
-   # --load /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-4B-Base
-   # --save /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-4B-Base-slime_PPO/
-   --hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-8B-Base
-   --ref-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/models/Qwen3-8B-Base-torch_dist
-   --load /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-8B-Base
-   --save /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/AsyPPO/Base/Actor_8B
-
-   # --critic-hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-1.7B-Base
-   # --critic-load /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-1.7B-Base
-   --critic-save /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/AsyPPO/Base/Critic_8B
-
+   --hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-4B-Base
+   # --hf-checkpoint /mnt/shared-storage-user/p1-shared/liyizhuo/share/models/Qwen3-4B
+   #--hf-checkpoint /root/Qwen3-4B-FP8
+   # --ref-load /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-4B-Base
+   --ref-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/models/Qwen3-4B-Base-torch_dist
+   --load /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-4B-Base
+   --save /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-4B-Base-slime_PPO/
    --save-interval 500
 )
 
 ROLLOUT_ARGS=(
-   # --prompt-data /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/DAPO-Math-17k/dapo-math-17k.jsonl
-   --prompt-data /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/AsyPPO/train.jsonl
+   --prompt-data /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/DAPO-Math-17k/dapo-math-17k.jsonl
    --input-key prompt
    --label-key label
    --apply-chat-template
@@ -57,10 +46,10 @@ ROLLOUT_ARGS=(
    --rm-type dapo
    --reward-key score
    
-   --num-rollout 500
+   --num-rollout 3000
    --rollout-batch-size 32
-   --n-samples-per-prompt 8
-   --rollout-max-response-len 10240
+   --n-samples-per-prompt 4
+   --rollout-max-response-len 16384
    --rollout-temperature 0.8
 
    --global-batch-size 128
@@ -69,18 +58,15 @@ ROLLOUT_ARGS=(
 
 EVAL_ARGS=(
    --eval-interval 10
-   # --eval-prompt-data aime /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/aime_2024/aime-2024.jsonl
-   # --eval-prompt-data aime /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/aime_2024/aime-2024-deepmathformat.jsonl
-   --eval-prompt-data aime2425 /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/AsyPPO/test.jsonl
+   --eval-prompt-data aime /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/aime_2024/aime-2024.jsonl
    --n-samples-per-eval-prompt 16
-   --eval-max-response-len 10240
-   --eval-top-p 0.95
-   --eval-temperature 0.6
+   --eval-max-response-len 16384
+   --eval-top-p 0.7
    --log-passrate
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 2
+   --tensor-model-parallel-size 1
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
@@ -93,7 +79,7 @@ PERF_ARGS=(
 
    # --micro-batch-size 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 9216
+   --max-tokens-per-gpu 17408
 )
 
 # GRPO_ARGS=(
@@ -115,10 +101,9 @@ PPO_ARGS=(
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
-   --num-critic-only-steps 10
+   # --num-critic-only-steps 1
    # --normalize-advantages
    --critic-lr 1e-6
-   --num-steps-per-rollout 2
 )
 
 OPTIMIZER_ARGS=(
@@ -131,14 +116,13 @@ OPTIMIZER_ARGS=(
 )
 
 export WANDB_DIR="/mnt/shared-storage-user/p1-shared/liyizhuo/code/slime/wandb"
-export WANDB_API_KEY="5cb606567741f22337bbbd70cf464c2951631e9a"
+export WANDB_API_KEY="local-a4a54f06b40d4ba93509fe73500b0e97296b0744"
 export WANDB_MODE="offline"
-
 
 WANDB_ARGS=(
    --use-wandb
-   --wandb-project AsyPPO
-   --wandb-group critic_size
+   --wandb-project slime-one
+   --wandb-group Qwen3-4B-PPO
    --wandb-key ${WANDB_API_KEY}
    --wandb-dir ${WANDB_DIR}
    --wandb-mode ${WANDB_MODE}
@@ -158,14 +142,6 @@ MISC_ARGS=(
    --attention-softmax-in-fp32
    # need to comment this when using model with MLA
    --attention-backend flash
-   # --use-hf-config-for-megatron
-)
-
-CUSTOM_ARGS=(
-   --log-position-value-stats
-   --max-log-positions 500
-   --lambd-actor 0.95
-   --lambd-critic 0.95
 )
 
 # launch the master node of ray in container
@@ -187,6 +163,7 @@ ray job submit --address="http://127.0.0.1:26500" \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node 4 \
    --colocate \
+   ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \
    ${OPTIMIZER_ARGS[@]} \
@@ -195,6 +172,4 @@ ray job submit --address="http://127.0.0.1:26500" \
    ${PERF_ARGS[@]} \
    ${EVAL_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
-   ${MODEL_ARGS[@]} \
-   ${CUSTOM_ARGS[@]} \
    ${MISC_ARGS[@]}

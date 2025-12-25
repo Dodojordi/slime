@@ -1461,7 +1461,10 @@ def slime_validate_args(args):
         args.critic_load = args.load
     if args.critic_lr is None:
         args.critic_lr = args.lr
-
+    if args.critic_hf_checkpoint is None:
+        args.critic_hf_checkpoint = args.critic_load
+    if args.critic_ref_load is None:
+        args.critic_ref_load = args.load
     if args.offload:
         args.offload_train = True
         args.offload_rollout = True
@@ -1616,7 +1619,10 @@ def hf_validate_args(args, hf_config):
 def _validate_and_update_megatron_args_from_hf(args, args_from_hf_config: dict[str, Any]):
     for key, value in args_from_hf_config.items():
         if hasattr(args, key) and getattr(args, key) != value:
-            raise ValueError(
-                f"Argument {key} is not consistent. {key} in args is {getattr(args, key)}, but from HF config is {value}."
+            # raise ValueError(
+            #     f"Argument {key} is not consistent. {key} in args is {getattr(args, key)}, but from HF config is {value}."
+            # )
+            logger.info(
+                f"Overriding argument {key} from {getattr(args, key)} to {value} (from HF config)"
             )
         setattr(args, key, value)

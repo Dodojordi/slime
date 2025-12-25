@@ -18,6 +18,7 @@ from slime.utils.ppo_utils import (
     get_grpo_returns,
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
+    compute_positive_nll_loss,
 )
 from slime.utils.types import RolloutBatch
 
@@ -247,19 +248,34 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         advantages = [r for r in returns]
 
     elif args.advantage_estimator == "ppo":
+        print("now,we are in compute_advantages_and_returns for ppo")
         # TODO: optimize this
+        # import pdb; pdb.set_trace()
         old_rewards = rewards
         rewards = []
-        for reward, k in zip(old_rewards, kl, strict=False):
+        # 计算 positive_nll_mask：用于标识哪些 token 应该用于 NLL 计算
+        positive_nll_mask = []
+        positive_reward_threshold = getattr(args, 'positive_reward_threshold', 0.0)
+        for reward, k, loss_mask in zip(old_rewards, kl, loss_masks, strict=False):
             k *= -args.kl_coef
             cp_rank = mpu.get_context_parallel_rank()
             if cp_rank == 0:
                 k[-1] += reward
             rewards.append(k)
+            
+            # 如果样本的 reward > threshold，则该样本的所有 token 的 mask 为 loss_mask，否则为 0
+            if reward > positive_reward_threshold:
+                positive_nll_mask.append(loss_mask.clone())
+            else:
+                positive_nll_mask.append(torch.zeros_like(loss_mask))
+        # advantages, returns = get_advantages_and_returns_batch(
+        #     total_lengths, response_lengths, values, rewards, args.gamma, args.lambd
+        # )
+        print("start to compute advantages and returns for ppo")
         advantages, returns = get_advantages_and_returns_batch(
-            total_lengths, response_lengths, values, rewards, args.gamma, args.lambd
+            total_lengths, response_lengths, values, rewards, args.gamma, args.lambd_actor, args.lambd_critic, use_adaptive_lambda=args.use_adaptive_lambda, alpha=args.alpha,
         )
-
+        print("end to compute advantages and returns for ppo")
     elif args.advantage_estimator == "reinforce_plus_plus":
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_reinforce_plus_plus_returns(
@@ -357,7 +373,9 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
 
     rollout_data["advantages"] = advantages
     rollout_data["returns"] = returns
-
+    # 添加 positive_nll_mask 到 rollout_data（仅在 PPO 且启用 positive_nll_loss 时）
+    if args.advantage_estimator == "ppo" and getattr(args, 'use_positive_nll_loss', False):
+        rollout_data["positive_nll_mask"] = positive_nll_mask
 
 def vanilla_tis_function(
     args,
@@ -542,7 +560,23 @@ def policy_loss_function(
     entropy_loss = sum_of_sample_mean(entropy)
 
     loss = pg_loss - args.entropy_coef * entropy_loss
-
+    # Positive Example LM Loss (NLL loss for correct samples)
+    if getattr(args, 'use_positive_nll_loss', False) and 'positive_nll_mask' in batch:
+        positive_nll_loss = compute_positive_nll_loss(
+            log_probs=log_probs,
+            positive_nll_mask=batch['positive_nll_mask'],
+            loss_masks=batch['loss_masks'],
+            response_lengths=response_lengths,
+            positive_reward_threshold=getattr(args, 'positive_reward_threshold', 0.0),
+            sum_of_sample_mean=sum_of_sample_mean,
+        )
+        
+        # 将NLL loss加入到总loss中: L(θ) = LPPO(θ) + μ * LNLL(θ)
+        positive_nll_coef = getattr(args, 'positive_nll_coef', 0.0)
+        loss = loss + positive_nll_coef * positive_nll_loss
+    else:
+        positive_nll_loss = None
+        
     if args.use_kl_loss:
         ref_log_probs = batch["ref_log_probs"]
         ref_log_probs = torch.cat(ref_log_probs, dim=0)
@@ -591,6 +625,9 @@ def policy_loss_function(
 
     if args.use_opsm:
         reported_loss["opsm_clipfrac"] = opsm_clipfrac
+    
+    if getattr(args, 'use_positive_nll_loss', False) and positive_nll_loss is not None:
+        reported_loss["positive_nll_loss"] = positive_nll_loss.clone().detach()
 
     return loss, reported_loss
 
@@ -644,9 +681,41 @@ def value_loss_function(
     if values.numel() == 0:
         loss += 0 * values.sum()
 
+    # Compute Explained Variance: EV = 1 - Var(y_true - y_pred) / Var(y_true)
+    # where y_true = returns, y_pred = values
+    with torch.no_grad():
+        # Get loss masks to compute variance only on valid tokens
+        loss_masks = torch.cat(batch["loss_masks"], dim=0)
+        
+        # Filter valid tokens using masks
+        valid_mask = loss_masks.bool()
+        if valid_mask.sum() > 0:
+            valid_returns = returns[valid_mask]
+            valid_values = values[valid_mask]
+            
+            # Compute residuals
+            residuals = valid_returns - valid_values
+            
+            # Compute variances
+            var_residuals = residuals.var(unbiased=False)
+            var_returns = valid_returns.var(unbiased=False)
+            
+            # Compute Explained Variance
+            # Add small epsilon to avoid division by zero
+            eps = 1e-8
+            if var_returns > eps:
+                explained_variance = 1.0 - var_residuals / (var_returns + eps)
+            else:
+                # If variance is too small, set EV to 0
+                explained_variance = torch.tensor(0.0, device=values.device, dtype=values.dtype)
+        else:
+            # No valid tokens, set EV to 0
+            explained_variance = torch.tensor(0.0, device=values.device, dtype=values.dtype)
+
     reported_loss = {
         "value_loss": loss.clone().detach(),
         "value_clipfrac": values_clipfrac.clone().detach(),
+        "explained_variance": explained_variance.clone().detach(),
     }
 
     return loss, reported_loss

@@ -183,7 +183,7 @@ def unpack_sequences(packed_batch: dict) -> list[dict]:
                             instance[key] = value[start_idx:end_idx]
                         else:
                             raise ValueError(f"Attribute {key} is not found in the packed batch")
-                    elif key in ["loss_masks", "advantages", "returns"]:
+                    elif key in ["loss_masks", "advantages", "returns", "positive_nll_mask"]:
                         instance[key] = value[sum(response_lengths[:i]) : sum(response_lengths[: i + 1])]
                 elif isinstance(value, list):
                     instance[key] = value[i]

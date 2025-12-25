@@ -26,6 +26,8 @@ def _map_common_configs(hf_config: PretrainedConfig) -> MegatronModelConfig:
     rope_scaling_args = {}
     if "rope_scaling" in hf_config and hf_config.rope_scaling is not None:
         rope_scaling_args["seq_len_interpolation_factor"] = hf_config.rope_scaling["factor"]
+    use_gqa = hf_config.num_key_value_heads != hf_config.num_attention_heads
+
     return MegatronModelConfig(
         transformer_config={
             # Model architecture parameters
@@ -35,7 +37,9 @@ def _map_common_configs(hf_config: PretrainedConfig) -> MegatronModelConfig:
             "num_query_groups": hf_config.num_key_value_heads,
             "ffn_hidden_size": hf_config.intermediate_size,
             "kv_channels": getattr(hf_config, "head_dim", None),
-            "layernorm_epsilon": hf_config.rms_norm_eps,
+            # "layernorm_epsilon": hf_config.rms_norm_eps,
+            "norm_epsilon": hf_config.rms_norm_eps,
+            "group_query_attention": use_gqa, 
             # Activation and normalization
             "activation_func": _get_activation_func(hf_config.hidden_act),
             "normalization": "RMSNorm",
@@ -71,6 +75,9 @@ def qwen3_config_mapper(hf_config: PretrainedConfig) -> MegatronModelConfig:
             "add_bias_linear": False,
             "add_qkv_bias": hf_config.attention_bias,
             "qk_layernorm": True,
+            "gated_linear_unit": True,
+            "swiglu": True,
+            "use_rotary_position_embeddings": True,
         }
     )
 
