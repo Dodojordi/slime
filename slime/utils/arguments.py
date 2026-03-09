@@ -616,7 +616,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--n-samples-per-eval-prompt",
                 type=int,
                 default=1,
-                help="number of responses for each prompt in generation",
+                nargs="+",  # ← 添加这个，支持多个值
+                help="number of responses for each prompt in generation (can specify multiple values for multiple datasets)",
             )
             parser.add_argument("--eval-temperature", type=float, default=None)
             parser.add_argument("--eval-top-p", type=float, default=None)
@@ -1368,6 +1369,26 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
         datasets_config = []
 
     eval_datasets = build_eval_dataset_configs(args, datasets_config, defaults)
+    
+    # 新增：如果提供了多个 n_samples_per_eval_prompt 值，分配给对应的数据集
+    if hasattr(args, 'n_samples_per_eval_prompt') and isinstance(args.n_samples_per_eval_prompt, list):
+        n_samples_list = args.n_samples_per_eval_prompt
+        if len(n_samples_list) == len(eval_datasets):
+            for dataset, n_samples in zip(eval_datasets, n_samples_list):
+                dataset.n_samples_per_eval_prompt = n_samples
+        elif len(n_samples_list) == 1:
+            # 如果只有一个值，应用到所有数据集
+            for dataset in eval_datasets:
+                dataset.n_samples_per_eval_prompt = n_samples_list[0]
+        else:
+            logger.warning(
+                f"Number of n_samples_per_eval_prompt values ({len(n_samples_list)}) "
+                f"does not match number of eval datasets ({len(eval_datasets)}). "
+                f"Using first value for all datasets."
+            )
+            for dataset in eval_datasets:
+                dataset.n_samples_per_eval_prompt = n_samples_list[0]
+    
     if eval_datasets:
         args.eval_prompt_data = [item for dataset in eval_datasets for item in (dataset.name, dataset.path)]
     else:
@@ -1443,7 +1464,7 @@ def slime_validate_args(args):
 
     if args.dump_details is not None:
         args.save_debug_rollout_data = f"{args.dump_details}/rollout_data/{{rollout_id}}.pt"
-        args.save_debug_train_data = f"{args.dump_details}/train_data/{{rollout_id}}_{{rank}}.pt"
+        args.save_debug_train_data = f"{args.dump_details}/train_data/{{rollout_id}}_{{rank}}_{{role}}.pt"
 
     if args.load_debug_rollout_data is not None:
         logger.info(

@@ -198,3 +198,107 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
     rollout_data["total_lengths"] = [total_lengths[i] for i in partition]
 
     return rollout_data
+# def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
+#     """
+#     处理 rollout 数据，支持当 dp_size 小于数据分片数时合并多个分片。
+    
+#     Args:
+#         args: 训练参数
+#         rollout_data_ref: Ray object references 列表，包含分片后的数据
+#         dp_rank: 当前进程的数据并行 rank
+#         dp_size: 当前模型的数据并行大小
+    
+#     Returns:
+#         合并后的 rollout_data 字典
+#     """
+#     num_data_shards = len(rollout_data_ref)
+    
+#     # 情况 1: dp_size 等于数据分片数（标准情况，Actor）
+#     if dp_size == num_data_shards:
+#         rollout_data = ray.get(rollout_data_ref[dp_rank].inner)
+#         partition = rollout_data.pop("partition")
+#         total_lengths = rollout_data["total_lengths"]
+        
+#         # save the seqlen of the whole rollout batch
+#         Timer().seq_lens = total_lengths
+#         rollout_data["total_lengths"] = [total_lengths[i] for i in partition]
+        
+#         return rollout_data
+    
+#     # 情况 2: dp_size 小于数据分片数（Critic 需要合并多个分片）
+#     elif dp_size < num_data_shards:
+#         # 验证数据分片数必须能被 dp_size 整除
+#         if num_data_shards % dp_size != 0:
+#             raise ValueError(
+#                 f"数据分片数量 ({num_data_shards}) 必须能被 dp_size ({dp_size}) 整除。"
+#                 f"当前 Actor 的数据并行度是 {num_data_shards}，"
+#                 f"Critic 的数据并行度是 {dp_size}。"
+#                 f"请确保 Actor GPU 数是 Critic GPU 数的整数倍。"
+#             )
+        
+#         # 计算每个 rank 应该处理多少个数据分片
+#         shards_per_rank = num_data_shards // dp_size
+        
+#         # 计算当前 rank 应该处理哪些数据分片
+#         start_shard_idx = dp_rank * shards_per_rank
+#         end_shard_idx = start_shard_idx + shards_per_rank
+        
+#         if dp_rank == 0:
+#             logger.info(
+#                 f"合并数据分片：dp_size={dp_size}, 数据分片数={num_data_shards}, "
+#                 f"每个 rank 处理 {shards_per_rank} 个分片"
+#             )
+        
+#         # 合并多个数据分片
+#         merged_rollout_data = None
+#         all_partitions = []
+        
+#         for shard_idx in range(start_shard_idx, end_shard_idx):
+#             rollout_data = ray.get(rollout_data_ref[shard_idx].inner)
+#             partition = rollout_data.pop("partition")
+#             all_partitions.extend(partition)
+            
+#             if merged_rollout_data is None:
+#                 # 第一个分片，直接使用
+#                 merged_rollout_data = rollout_data
+#             else:
+#                 # 合并后续分片的列表类型数据
+#                 for key in [
+#                     "tokens",
+#                     "multimodal_inputs",
+#                     "response_lengths",
+#                     "rewards",
+#                     "truncated",
+#                     "loss_masks",
+#                     "round_number",
+#                     "sample_indices",
+#                     "rollout_log_probs",
+#                     "rollout_routed_experts",
+#                     "prompt",
+#                     "teacher_log_probs",
+#                     "positive_nll_mask",
+#                 ]:
+#                     if key in rollout_data and key in merged_rollout_data:
+#                         merged_rollout_data[key].extend(rollout_data[key])
+#                     elif key in rollout_data:
+#                         # 第一个分片没有这个 key，但后续分片有
+#                         merged_rollout_data[key] = rollout_data[key]
+                
+#                 # 对于非列表类型的数据（如 raw_reward, total_lengths），保持不变
+#                 # 这些数据在所有分片中是相同的全局数据
+        
+#         total_lengths = merged_rollout_data["total_lengths"]
+        
+#         # save the seqlen of the whole rollout batch
+#         Timer().seq_lens = total_lengths
+#         merged_rollout_data["total_lengths"] = [total_lengths[i] for i in all_partitions]
+        
+#         return merged_rollout_data
+    
+#     # 情况 3: dp_size 大于数据分片数（不支持）
+#     else:
+#         raise ValueError(
+#             f"不支持 dp_size ({dp_size}) 大于数据分片数 ({num_data_shards})。"
+#             f"这意味着 Critic 的 GPU 数多于 Actor 的 GPU 数，"
+#             f"当前框架不支持这种配置。请确保 Actor GPU 数 >= Critic GPU 数。"
+#         )

@@ -139,6 +139,18 @@ class RayTrainGroup:
                 for actor, critic in zip(self._actor_handlers, critic_group._actor_handlers, strict=False)
             ]
         )
-
+    # 添加连接第二个 critic 的方法
+    def connect_critic2(self, critic_group):
+        return ray.get(
+            [
+                actor.connect_actor_critic2.remote(critic)
+                for actor, critic in zip(self._actor_handlers, critic_group._actor_handlers, strict=False)
+            ]
+        )
+    
+    def async_train_critic_with_returns(self):
+        """Complete critic training after receiving returns from actor (Stage 2)"""
+        return [actor.train_critic_with_returns.remote() for actor in self._actor_handlers]
+    
     def set_rollout_manager(self, rollout_manager):
         return ray.get([actor.set_rollout_manager.remote(rollout_manager) for actor in self._actor_handlers])

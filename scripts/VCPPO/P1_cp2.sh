@@ -25,7 +25,7 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 EXP_NAME="${EXP_NAME:-exp_$(date +%Y%m%d_%H%M%S)}"
 # EXP_NAME="verify_lambd_adaptive_0.05"
 # EXP_NAME="1_7BCritic+WARMUP+32*4"  # Single critic
-EXP_NAME="ADEBUG-4bsftv2_doublecritic1.7b-32*4-64k-utd2-xverify"  # Double critic configuration
+EXP_NAME="6gpus-4bsftv2_doublecritic1.7b-32*4-64k-utd2-xverify"  # Double critic configuration
 # EXP_NAME="?????"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # source "${SCRIPT_DIR}/models/qwen3-4B.sh"
@@ -37,7 +37,7 @@ PP_SIZE=1
 CP_SIZE=1
 EP_SIZE=1
 ETP_SIZE=1
-MAX_LEN=$((1024 * 40))
+MAX_LEN=$((1024 * 64))
 MAX_TOKENS_PER_GPU=$((($MAX_LEN / $CP_SIZE) + 1024))
 ROLLOUT_BATCH_SIZE=32
 N_SAMPLES_PER_PROMPT=4

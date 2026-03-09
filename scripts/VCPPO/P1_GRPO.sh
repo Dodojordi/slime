@@ -25,14 +25,14 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 EXP_NAME="${EXP_NAME:-exp_$(date +%Y%m%d_%H%M%S)}"
 # EXP_NAME="verify_lambd_adaptive_0.05"
 # EXP_NAME="1_7BCritic+WARMUP+32*4"  # Single critic
-EXP_NAME="ADEBUG-4bsftv2_doublecritic1.7b-32*4-64k-utd2-xverify"  # Double critic configuration
+EXP_NAME="GRPO-32*4-40k-utd2-xverify-nomarking"  # Double critic configuration
 # EXP_NAME="?????"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # source "${SCRIPT_DIR}/models/qwen3-4B.sh"
 SAVE_DIR="/mnt/shared-storage-user/p1-shared/liyizhuo/share/save/P1_PPO/Qwen3-1_7B-Base-${EXP_NAME}/"
 CRITIC_SAVE_DIR="${SAVE_DIR}/critic"
 CRITIC2_SAVE_DIR="${SAVE_DIR}/critic2"
-TP_SIZE=2
+TP_SIZE=4
 PP_SIZE=1
 CP_SIZE=1
 EP_SIZE=1
@@ -41,7 +41,7 @@ MAX_LEN=$((1024 * 40))
 MAX_TOKENS_PER_GPU=$((($MAX_LEN / $CP_SIZE) + 1024))
 ROLLOUT_BATCH_SIZE=32
 N_SAMPLES_PER_PROMPT=4
-NUM_STEPS_PER_ROLLOUT=2
+NUM_STEPS_PER_ROLLOUT=4
 
 # Check if resume checkpoint exists
 if [ -n "$RESUME_CHECKPOINT_DIR" ] && [ -d "$RESUME_CHECKPOINT_DIR" ]; then
@@ -122,7 +122,7 @@ else
        --critic-save ${CRITIC_SAVE_DIR}
        
        # Critic2 configuration (second critic model)
-       --use-critic2
+      #  --use-critic2
        --critic2-hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-1.7B-Base
        --critic2-ref-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-1_7B-Base-17B_CriticPretrain/critic
        --critic2-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-1_7B-Base-17B_CriticPretrain/critic
@@ -136,7 +136,7 @@ ROLLOUT_ARGS=(
 #    --prompt-data /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/debug2.jsonl
    # --prompt-data /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/DAPO-Math-17k/dapo-math-17k.jsonl
    # --prompt-data proofdata /mnt/shared-storage-user/p1-shared/chenjiacheng/data/imo/train_math_data_with_marking_7pt_valid.jsonl math1205 /mnt/shared-storage-user/p1-shared/chenjiacheng/data/imo/train_math_data_verifiable_1205_processed_v3.jsonl
-   --prompt-data /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/P1/merge.jsonl
+   --prompt-data /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/P1/train_math_data_verifiable_1205_processed_v3.jsonl
    --input-key prompt
    --label-key label
    --apply-chat-template
@@ -203,7 +203,7 @@ PERF_ARGS=(
 # )
 
 PPO_ARGS=(
-   --advantage-estimator ppo
+   --advantage-estimator grpo
    # --use-kl-loss
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
@@ -288,7 +288,7 @@ DEBUG_ARGS=(
 )
 
 CUSTOM_ARGS=(
-   --use-asyppo
+   # --use-asyppo
    --use-hf-config-for-megatron
    --log-position-value-stats
    --max-log-positions 500
@@ -302,7 +302,7 @@ CUSTOM_ARGS=(
    # --use-positive-nll-loss
 #    --positive-nll-coef 0.1
 #    --positive-reward-threshold 0.0
-   # --eval-first
+   --eval-first
    --finetune
    --no-load-optim
    # --use-asytrain-critic
@@ -317,7 +317,6 @@ CUSTOM_ARGS=(
 #    --critic2-num-nodes 1
    --eval-use-xverify
    # --eval-group
-   --log-probs-chunk-size 8192
    --train-use-xverify
    # --eval-log-dir ${DEBUG_DIR}/eval
    # --start-rollout-id 0
@@ -360,7 +359,7 @@ if [ "$RANK" == "0" ]; then
       --runtime-env-json="${RUNTIME_ENV_JSON}" \
       -- python3 train.py \
       --actor-num-nodes 1 \
-      --actor-num-gpus-per-node 2 \
+      --actor-num-gpus-per-node 4 \
       --colocate \
       ${CKPT_ARGS[@]} \
       ${ROLLOUT_ARGS[@]} \

@@ -358,6 +358,8 @@ def train_one_step(
                 "log_probs",
                 "ref_log_probs",
                 "values",
+                "values_critic1",  # 添加这行
+                "values_critic2",  # 添加这行
                 "advantages",
                 "returns",
                 "rollout_log_probs",

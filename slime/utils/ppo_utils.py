@@ -194,6 +194,34 @@ class _VocabParallelEntropy(torch.autograd.Function):
         return softmax_logits, None
 
 
+def _compute_entropy_no_autograd(
+    vocab_parallel_logits: torch.Tensor, 
+    process_group: dist.ProcessGroup
+) -> torch.Tensor:
+    """
+    纯 forward 的 entropy 计算，不使用 autograd.Function。
+    
+    不构建计算图，不保存中间张量，仅用于监控。
+    当 entropy_coef=0 时调用此函数，可节省约 29 GB 显存（64k 序列）。
+    """
+    # 和 _VocabParallelEntropy.forward 相同的数学逻辑，但不调用 ctx.save_for_backward
+    logits_max = vocab_parallel_logits.max(dim=-1, keepdim=True).values
+    dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=process_group)
+    
+    normalized = vocab_parallel_logits - logits_max
+    exp_logits = normalized.exp()
+    
+    sum_exp = exp_logits.sum(dim=-1, keepdim=True)
+    dist.all_reduce(sum_exp, group=process_group)
+    
+    softmax_logits = exp_logits / sum_exp
+    sum_softmax_logits = (softmax_logits * vocab_parallel_logits).sum(dim=-1, keepdim=True)
+    dist.all_reduce(sum_softmax_logits, group=process_group)
+    
+    entropy = logits_max + sum_exp.log() - sum_softmax_logits
+    return entropy.squeeze(dim=-1)
+
+
 def compute_entropy_from_logits(logits: torch.Tensor, process_group) -> torch.Tensor:
     return _VocabParallelEntropy.apply(logits, process_group)
 
@@ -535,6 +563,12 @@ def get_advantages_and_returns_batch(
                 logger.info(f"Adaptive lambda (lambd_critic) computed: {lambd_critic}")
 
         cp_size = mpu.get_context_parallel_world_size()
+        logger.info(f"cp_size: {cp_size}")
+        # logger.info(f"values_list: {values_list}")
+        # logger.info(f"rewards_list: {rewards_list}")
+        # logger.info(f"total_lengths: {total_lengths}")
+        # logger.info(f"response_lengths: {response_lengths}")
+        # logger.info(f"chunked: {chunked}")
         device = values_list[0].device
         dtype = values_list[0].dtype
 
@@ -901,23 +935,111 @@ def chunked_gae_single_lambda(
     
     return advantages
 
-def calculate_log_probs_and_entropy(logits, tokens, tp_group, with_entropy: bool = False):
-    logits = logits.contiguous()
-    # TODO: not sure why we need to clone the logits here.
-    # Without the clone, the backward will trigger inplace edit error.
-    # It seems that the function with tp will modify the logits inplace.
-    if logits.size(0) != 0:
-        log_prob = compute_log_probs(logits.clone(), tokens, tp_group)
-    else:
-        log_prob = logits.new_zeros((0,))
+# def calculate_log_probs_and_entropy(logits, tokens, tp_group, with_entropy: bool = False):
+#     logits = logits.contiguous()
+#     # TODO: not sure why we need to clone the logits here.
+#     # Without the clone, the backward will trigger inplace edit error.
+#     # It seems that the function with tp will modify the logits inplace.
+#     if logits.size(0) != 0:
+#         log_prob = compute_log_probs(logits.clone(), tokens, tp_group)
+#     else:
+#         log_prob = logits.new_zeros((0,))
 
-    if with_entropy:
-        if logits.size(0) != 0:
-            entropy = compute_entropy_from_logits(logits.clone(), tp_group)
+#     if with_entropy:
+#         if logits.size(0) != 0:
+#             entropy = compute_entropy_from_logits(logits.clone(), tp_group)
+#         else:
+#             entropy = logits.new_zeros((0,))
+#     else:
+#         entropy = None
+#     return log_prob, entropy
+def calculate_log_probs_and_entropy(
+    logits, 
+    tokens, 
+    tp_group, 
+    with_entropy: bool = False, 
+    chunk_size: int = -1,
+    requires_entropy_grad: bool = True  # 新增参数
+):
+    """计算 log probs 和 entropy，支持条件梯度追踪。
+    
+    Args:
+        logits: 模型输出的 logits
+        tokens: 目标 tokens
+        tp_group: Tensor Parallel 通信组
+        with_entropy: 是否计算 entropy
+        chunk_size: 分块大小，-1 表示不分块
+        requires_entropy_grad: entropy 是否需要梯度（当 entropy_coef=0 时设为 False）
+    
+    Returns:
+        log_prob: Log probabilities
+        entropy: Entropy 值（如果 with_entropy=True）
+    """
+    import contextlib  # 确保导入
+    
+    logits = logits.contiguous()
+    entropy = None
+    
+    if logits.size(0) != 0:
+        # === 计算 log_probs（总是需要梯度）===
+        if chunk_size > 0:
+            # 分块计算 log_probs
+            num_chunks = (logits.size(0) - 1) // chunk_size + 1
+            tokens_chunks = tokens.chunk(num_chunks, dim=0)
+            logits_chunks = logits.chunk(num_chunks, dim=0)
+            
+            log_probs = []
+            for tokens_chunk, logits_chunk in zip(tokens_chunks, logits_chunks, strict=True):
+                log_prob = compute_log_probs(logits_chunk.clone(), tokens_chunk, tp_group)
+                log_probs.append(log_prob)
+            log_prob = torch.cat(log_probs, dim=0)
         else:
-            entropy = logits.new_zeros((0,))
+            # 不分块
+            log_prob = compute_log_probs(logits.clone(), tokens, tp_group)
+        
+        # === 计算 entropy（条件梯度追踪）===
+        # if with_entropy:
+        #     # 🔑 关键修改：根据 requires_entropy_grad 选择上下文
+        #     entropy_context = torch.no_grad() if not requires_entropy_grad else contextlib.nullcontext()
+            
+        #     with entropy_context:
+        #         if chunk_size > 0:
+        #             # 分块计算 entropy
+        #             entropys = []
+        #             for _, logits_chunk in zip(tokens_chunks, logits_chunks, strict=True):
+        #                 e = compute_entropy_from_logits(logits_chunk.clone(), tp_group)
+        #                 entropys.append(e)
+        #             entropy = torch.cat(entropys, dim=0)
+        #         else:
+        #             # 不分块
+        #             entropy = compute_entropy_from_logits(logits.clone(), tp_group)
+        if with_entropy:
+            if chunk_size > 0:
+                # 分块计算 entropy
+                entropys = []
+                for _, logits_chunk in zip(tokens_chunks, logits_chunks, strict=True):
+                    if requires_entropy_grad:
+                        # 需要梯度：使用 autograd.Function
+                        e = compute_entropy_from_logits(logits_chunk.clone(), tp_group)
+                    else:
+                        # 不需要梯度：使用纯 forward 函数，不保存中间张量
+                        with torch.no_grad():
+                            e = _compute_entropy_no_autograd(logits_chunk.clone(), tp_group)
+                    entropys.append(e)
+                entropy = torch.cat(entropys, dim=0)
+            else:
+                # 不分块
+                if requires_entropy_grad:
+                    entropy = compute_entropy_from_logits(logits.clone(), tp_group)
+                else:
+                    with torch.no_grad():
+                        entropy = _compute_entropy_no_autograd(logits.clone(), tp_group)
     else:
-        entropy = None
+        # 空序列处理
+        log_prob = logits.new_zeros((0,))
+        if with_entropy:
+            entropy = logits.new_zeros((0,))
+    
     return log_prob, entropy
 
 
@@ -984,3 +1106,170 @@ def compute_positive_nll_loss(
     nll_loss = -all_positive_log_probs.sum() / total_positive_tokens
     
     return nll_loss
+
+def compute_advantage_diff_mask(
+    values1: list[torch.Tensor],
+    values2: list[torch.Tensor],
+    top_k_percent: float = 0.1,
+    response_lengths: list[int] | None = None,
+) -> list[torch.Tensor]:
+    """
+    计算基于两个critic值差异的advantage mask（token级别）。
+    
+    根据公式(4)，计算两个critic输出在每个token位置的标准差，
+    然后在所有token中找出标准差最小（agreement最高）的top_k_percent，
+    mask掉这些低信息token的advantage。
+    
+    Args:
+        values1: 第一个critic的value估计列表，每个元素shape=[response_length]
+        values2: 第二个critic的value估计列表，每个元素shape=[response_length]
+        top_k_percent: mask掉标准差最小的top k%的token，默认0.1表示mask掉10%的token
+        response_lengths: 每个样本的response长度列表（可选，用于验证）
+    
+    Returns:
+        mask_list: 每个样本的mask tensor列表，1表示保留，0表示mask掉
+    
+    公式解释：
+    - σ_t = std(V1_t, V2_t) 计算每个token位置两个critic的标准差
+    - 在所有token中找出标准差最小的top k%: Low_k(σ)
+    - 这些token的 I^A_t = 0（被mask），其余 I^A_t = 1（保留）
+    """
+    assert len(values1) == len(values2), f"values1和values2长度不匹配: {len(values1)} vs {len(values2)}"
+    
+    device = values1[0].device
+    dtype = values1[0].dtype
+    
+    # Step 1: 计算每个token位置的标准差
+    token_std_list = []
+    for v1, v2 in zip(values1, values2, strict=True):
+        # 检查形状是否一致
+        assert v1.shape == v2.shape, f"values形状不匹配: {v1.shape} vs {v2.shape}"
+        
+        # 计算每个token位置的标准差: σ_t = std(V1_t, V2_t)
+        # 将两个值堆叠成[2, response_length]，然后沿dim=0计算std
+        stacked = torch.stack([v1, v2], dim=0)  # [2, response_length]
+        token_std = torch.std(stacked, dim=0, unbiased=False)  # [response_length]
+        
+        token_std_list.append(token_std)
+    
+    # Step 2: 将所有token的标准差拼接成一个大tensor
+    all_token_std = torch.cat(token_std_list, dim=0)  # [total_tokens]
+    total_tokens = all_token_std.numel()
+    
+    # Step 3: 精确选出 std 最小的 top_k 个 token 的“全局索引”
+    num_to_mask = max(1, int(total_tokens * top_k_percent))
+    num_to_mask = min(num_to_mask, total_tokens)
+
+    # 取最小的 num_to_mask 个位置（精确到索引，而不是阈值）
+    _, flat_mask_indices = torch.topk(
+        all_token_std,
+        k=num_to_mask,
+        largest=False,   # 最小的
+        sorted=False,
+    )
+
+    # Step 4: 根据索引构造全局 mask，再切回每个样本
+    global_mask = torch.ones(total_tokens, device=all_token_std.device, dtype=all_token_std.dtype)
+    global_mask[flat_mask_indices] = 0.0
+
+    mask_list = []
+    offset = 0
+    for token_std in token_std_list:
+        n = token_std.numel()
+        mask_list.append(global_mask[offset : offset + n].view_as(token_std))
+        offset += n
+    assert offset == total_tokens
+    
+    # Step 5: 统计信息
+    total_masked = sum([(mask == 0).sum().item() for mask in mask_list])
+    std_min = all_token_std.min().item()
+    std_max = all_token_std.max().item()
+    std_mean = all_token_std.mean().item()
+    
+    logger.info(
+        f"Advantage diff mask (token-level): masked {total_masked}/{total_tokens} tokens "
+        f"(top {top_k_percent*100:.1f}% lowest std by exact indices). "
+        f"Std - min: {std_min:.4f}, max: {std_max:.4f}, mean: {std_mean:.4f}"
+    )
+    
+    return mask_list
+
+
+def compute_entropy_mask_by_value_divergence(
+    values1: list[torch.Tensor],
+    values2: list[torch.Tensor],
+    top_h_percent: float = 0.2,
+    response_lengths: list[int] | None = None,
+) -> list[torch.Tensor]:
+    """
+    计算基于两个critic值差异的熵正则化过滤mask（token级别）。
+    
+    根据论文公式(5)，计算两个critic输出在每个token位置的标准差，
+    然后在所有token中找出标准差最大（分歧最大）的top_h_percent，
+    将这些高分歧token的熵正则化项过滤掉（mask=0），其余保留（mask=1）。
+    
+    Args:
+        values1: 第一个critic的value估计列表，每个元素shape=[response_length]
+        values2: 第二个critic的value估计列表，每个元素shape=[response_length]
+        top_h_percent: 过滤掉标准差最大的top h%的token，默认0.1表示过滤掉10%的token
+        response_lengths: 每个样本的response长度列表（可选，用于验证）
+    
+    Returns:
+        mask_list: 每个样本的mask tensor列表，1表示保留熵正则化，0表示过滤掉
+    
+    公式解释：
+    - σ_t = std(V1_t, V2_t) 计算每个token位置两个critic的标准差
+    - 在所有token中找出标准差最大的top h%: top_h(σ)
+    - 对于这些token: I^H_t = 0（过滤掉熵正则化）
+    - 对于其余token: I^H_t = 1（保留熵正则化）
+    """
+    assert len(values1) == len(values2), f"values1和values2长度不匹配: {len(values1)} vs {len(values2)}"
+    
+    device = values1[0].device
+    dtype = values1[0].dtype
+    
+    # Step 1: 计算每个token位置的标准差
+    token_std_list = []
+    for v1, v2 in zip(values1, values2, strict=True):
+        # 检查形状是否一致
+        assert v1.shape == v2.shape, f"values形状不匹配: {v1.shape} vs {v2.shape}"
+        
+        # 计算每个token位置的标准差: σ_t = std(V1_t, V2_t)
+        # 将两个值堆叠成[2, response_length]，然后沿dim=0计算std
+        stacked = torch.stack([v1, v2], dim=0)  # [2, response_length]
+        token_std = torch.std(stacked, dim=0, unbiased=False)  # [response_length]
+        
+        token_std_list.append(token_std)
+    
+    # Step 2: 将所有token的标准差拼接成一个大tensor
+    all_token_std = torch.cat(token_std_list, dim=0)  # [total_tokens]
+    total_tokens = all_token_std.numel()
+    
+    # Step 3: 找出标准差最大的top_h个token（分歧最大的token）
+    num_to_mask = max(1, int(total_tokens * top_h_percent))
+    
+    # 获取标准差最大的top_h个token的阈值
+    # torch.kthvalue 返回第k小的值
+    # 我们需要第(total_tokens - num_to_mask + 1)小的值作为阈值
+    k_value = max(1, total_tokens - num_to_mask + 1)
+    threshold_std, _ = torch.kthvalue(all_token_std, k_value)
+    
+    # Step 4: 创建mask：标准差大于等于阈值的token被过滤掉（mask=0）
+    mask_list = []
+    for token_std in token_std_list:
+        # 对于标准差 >= threshold 的token（高分歧），mask设为0；其余为1
+        mask = (token_std < threshold_std).float()
+        mask_list.append(mask)
+    
+    # Step 5: 统计信息
+    total_masked = sum([(mask == 0).sum().item() for mask in mask_list])
+    std_min = all_token_std.min().item()
+    std_max = all_token_std.max().item()
+    std_mean = all_token_std.mean().item()
+    
+    logger.info(f"Entropy mask (value divergence): masked {total_masked}/{total_tokens} tokens "
+                f"(top {top_h_percent*100:.1f}% highest std). "
+                f"Std - min: {std_min:.4f}, max: {std_max:.4f}, mean: {std_mean:.4f}, "
+                f"threshold: {threshold_std.item():.4f}")
+    
+    return mask_list

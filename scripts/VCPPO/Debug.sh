@@ -25,10 +25,11 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 EXP_NAME="${EXP_NAME:-exp_$(date +%Y%m%d_%H%M%S)}"
 # EXP_NAME="verify_lambd_adaptive_0.05"
 # EXP_NAME="1_7BCritic+WARMUP+32*4"  # Single critic
-EXP_NAME="ADEBUG-4bsftv2_doublecritic1.7b-32*4-64k-utd2-xverify"  # Double critic configuration
+EXP_NAME="debug"  # Double critic configuration
 # EXP_NAME="?????"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-# source "${SCRIPT_DIR}/models/qwen3-4B.sh"
+export MODEL_ARGS_ROTARY_BASE=5000000
+source "${SCRIPT_DIR}/models/qwen3-4B.sh"
 SAVE_DIR="/mnt/shared-storage-user/p1-shared/liyizhuo/share/save/P1_PPO/Qwen3-1_7B-Base-${EXP_NAME}/"
 CRITIC_SAVE_DIR="${SAVE_DIR}/critic"
 CRITIC2_SAVE_DIR="${SAVE_DIR}/critic2"
@@ -37,11 +38,10 @@ PP_SIZE=1
 CP_SIZE=1
 EP_SIZE=1
 ETP_SIZE=1
-MAX_LEN=$((1024 * 40))
+MAX_LEN=$((1024 * 32))
 MAX_TOKENS_PER_GPU=$((($MAX_LEN / $CP_SIZE) + 1024))
-ROLLOUT_BATCH_SIZE=32
+ROLLOUT_BATCH_SIZE=16
 N_SAMPLES_PER_PROMPT=4
-NUM_STEPS_PER_ROLLOUT=2
 
 # Check if resume checkpoint exists
 if [ -n "$RESUME_CHECKPOINT_DIR" ] && [ -d "$RESUME_CHECKPOINT_DIR" ]; then
@@ -122,7 +122,7 @@ else
        --critic-save ${CRITIC_SAVE_DIR}
        
        # Critic2 configuration (second critic model)
-       --use-critic2
+      #  --use-critic2
        --critic2-hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-1.7B-Base
        --critic2-ref-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-1_7B-Base-17B_CriticPretrain/critic
        --critic2-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-1_7B-Base-17B_CriticPretrain/critic
@@ -142,7 +142,7 @@ ROLLOUT_ARGS=(
    --apply-chat-template
    --rollout-shuffle
    --rm-type remote_rm
-   --rm-url "http://10.102.203.45:8021/"
+   --rm-url "http://10.102.247.32:8001/"
    --reward-key score
    
    --num-rollout 6000
@@ -152,7 +152,7 @@ ROLLOUT_ARGS=(
    --rollout-temperature 1.0
 
    # --global-batch-size 128
-   --num-steps-per-rollout $NUM_STEPS_PER_ROLLOUT
+   --num-steps-per-rollout 1
    --use-tis
    --partial-rollout
    --over-sampling-batch-size $((ROLLOUT_BATCH_SIZE * 2))
@@ -162,12 +162,12 @@ ROLLOUT_ARGS=(
 N_SAMPLES_PER_EVAL=(4 1 4)
 IMO_PATH=/mnt/shared-storage-user/p1-shared/zhaoyufeng/eval_results/test_jsonl
 EVAL_ARGS=(
-   --eval-interval 4
+   --eval-interval 1
    --eval-prompt-data amo $IMO_PATH/amobench.jsonl answerbench $IMO_PATH/answerbench.jsonl proofbench /mnt/shared-storage-user/p1-shared/chenjiacheng/data/imo/proofbench.jsonl
    --n-samples-per-eval-prompt ${N_SAMPLES_PER_EVAL[@]}
    --eval-max-response-len 81920
    --eval-top-p 0.95
-   --eval-temperature 1.0
+   --eval-temperature 0.6
    --log-passrate
 )
 
@@ -203,8 +203,8 @@ PERF_ARGS=(
 # )
 
 PPO_ARGS=(
-   --advantage-estimator ppo
-   # --use-kl-loss
+   --advantage-estimator grpo
+   --use-kl-loss
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --kl-coef 0.00
@@ -255,13 +255,8 @@ SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 2
    --sglang-mem-fraction-static 0.7
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
-   --sglang-speculative-algorithm EAGLE3
-   --sglang-speculative-num-steps 3
-   --sglang-speculative-eagle-topk 1
-   --sglang-speculative-num-draft-tokens 4
-   --sglang-speculative-draft-model-path /mnt/shared-storage-user/p1-shared/leihaodi/spec_decode/draft-model/Qwen3-4B-Eagle3-Zjcxy-SmartAI
 )
-export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+
 MISC_ARGS=(
    # default dropout in megatron is 0.1
    --attention-dropout 0.0
@@ -288,8 +283,8 @@ DEBUG_ARGS=(
 )
 
 CUSTOM_ARGS=(
-   --use-asyppo
-   --use-hf-config-for-megatron
+   # --use-asyppo
+   # --use-hf-config-for-megatron
    --log-position-value-stats
    --max-log-positions 500
    # --lambd 1
@@ -299,15 +294,16 @@ CUSTOM_ARGS=(
    # --use-adaptive-lambda
    # --alpha 0.05
    --log-position-advantage-stats
+   --num-steps-per-rollout 1
    # --use-positive-nll-loss
 #    --positive-nll-coef 0.1
 #    --positive-reward-threshold 0.0
-   # --eval-first
+   --eval-first
    --finetune
    --no-load-optim
    # --use-asytrain-critic
-   # --use-advantage-diff-mask
-   # --advantage-diff-mask-k 0.1
+   --use-advantage-diff-mask
+   --advantage-diff-mask-k 0.1
    # --use-entropy-value-divergence-filter
    # --entropy-divergence-filter-h 0.2
    # --entropy-coef 0.001
@@ -317,16 +313,15 @@ CUSTOM_ARGS=(
 #    --critic2-num-nodes 1
    --eval-use-xverify
    # --eval-group
-   --log-probs-chunk-size 8192
    --train-use-xverify
    # --eval-log-dir ${DEBUG_DIR}/eval
-   # --start-rollout-id 0
+   --start-rollout-id 0
 )
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 # 使用 8 GPUs: Actor(2) + Critic1(colocate with actor) + Critic2(2) + Rollout(2-4)
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 6 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=26500
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 2 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=26500
 
 # Build the runtime environment JSON with proper variable substitution
 RUNTIME_ENV_JSON="{
@@ -353,7 +348,6 @@ if [ -z "$RANK" ]; then
 fi
 
 
-# ${MODEL_ARGS[@]} \
 # ========= Submit Ray Job (rank 0 only) =========
 if [ "$RANK" == "0" ]; then
    ray job submit --address="http://127.0.0.1:26500" \
@@ -362,6 +356,7 @@ if [ "$RANK" == "0" ]; then
       --actor-num-nodes 1 \
       --actor-num-gpus-per-node 2 \
       --colocate \
+      ${MODEL_ARGS[@]} \
       ${CKPT_ARGS[@]} \
       ${ROLLOUT_ARGS[@]} \
       ${OPTIMIZER_ARGS[@]} \

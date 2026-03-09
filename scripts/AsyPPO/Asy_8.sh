@@ -24,11 +24,13 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 EXP_NAME="${EXP_NAME:-exp_$(date +%Y%m%d_%H%M%S)}"
 # EXP_NAME="verify_lambd_adaptive_0.05"
-EXP_NAME="CP+BCLR+WARMUP+onesteps+NLL"
+# EXP_NAME="1_7BCritic+WARMUP+32*4"  # Single critic
+EXP_NAME="DoubleCritic_1.7B+AsyData+AdvFilter20%-Real-V5"  # Double critic configuration
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "${SCRIPT_DIR}/models/qwen3-4B.sh"
+# source "${SCRIPT_DIR}/models/qwen3-4B.sh"
 SAVE_DIR="/mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-4B-Base-${EXP_NAME}/"
 CRITIC_SAVE_DIR="${SAVE_DIR}/critic"
+CRITIC2_SAVE_DIR="${SAVE_DIR}/critic2"
 
 # CKPT_ARGS=(
 #    --hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-4B-Base
@@ -53,11 +55,18 @@ CRITIC_SAVE_DIR="${SAVE_DIR}/critic"
 # Example: Resume from iter_0000059 (rollout 59) -> start from rollout 60
 # RESUME_CHECKPOINT_DIR="/mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-4B-Base-CP+BCLR+WARMUP_2steps"
 # RESUME_CRITIC_CHECKPOINT_DIR="/mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-4B-Base-CP+BCLR+WARMUP_2steps/critic"
+# RESUME_CRITIC2_CHECKPOINT_DIR="/mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-4B-Base-CP+BCLR+WARMUP_2steps/critic2"
 # RESUME_ROLLOUT_ID=100  # Start from rollout 100 (checkpoint is at iteration 99)
 # # RESUME_CHECKPOINT_DIR=""
 # RESUME_CRITIC_CHECKPOINT_DIR=""
+# RESUME_CRITIC2_CHECKPOINT_DIR=""
 # RESUME_ROLLOUT_ID=0
-
+# RESUME_ROLLOUT_ID=200
+# RESUME_CHECKPOINT_DIR="/mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-4B-Base-SingleCritic_4B+WARMUP+32*4"
+# RESUME_CRITIC_CHECKPOINT_DIR="/mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-4B-Base-SingleCritic_4B+WARMUP+32*4/critic"
+# USE_RESUME_CHECKPOINT=true
+# USE_RESUME_CRITIC_CHECKPOINT=true
+# USE_RESUME_CRITIC2_CHECKPOINT=false
 # Check if resume checkpoint exists
 if [ -n "$RESUME_CHECKPOINT_DIR" ] && [ -d "$RESUME_CHECKPOINT_DIR" ]; then
     # Check for latest_checkpointed_iteration.txt or similar checkpoint indicator
@@ -88,23 +97,38 @@ if [ "$USE_RESUME_CHECKPOINT" = true ] && [ -n "$RESUME_CRITIC_CHECKPOINT_DIR" ]
 else
     USE_RESUME_CRITIC_CHECKPOINT=false
 fi
+
+# Check critic2 checkpoint if resume is enabled
+if [ "$USE_RESUME_CHECKPOINT" = true ] && [ -n "$RESUME_CRITIC2_CHECKPOINT_DIR" ] && [ -d "$RESUME_CRITIC2_CHECKPOINT_DIR" ]; then
+    echo "✅ Found resume critic2 checkpoint at: ${RESUME_CRITIC2_CHECKPOINT_DIR}"
+    USE_RESUME_CRITIC2_CHECKPOINT=true
+else
+    USE_RESUME_CRITIC2_CHECKPOINT=false
+fi
 # ========================================================================
 
 # Set checkpoint arguments based on resume status
 if [ "$USE_RESUME_CHECKPOINT" = true ]; then
     CKPT_ARGS=(
        --hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-4B-Base
-       --ref-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-4B-Base-CP+BCLR+WARMUP_2steps
+       --ref-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/models/Qwen3-4B-Base-torch_dist
        --load ${RESUME_CHECKPOINT_DIR}
        --start-rollout-id ${RESUME_ROLLOUT_ID}
        --save ${RESUME_CHECKPOINT_DIR}
        
        --critic-hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-4B-Base
-       $(if [ "$USE_RESUME_CRITIC_CHECKPOINT" = true ]; then echo "--critic-ref-load ${RESUME_CRITIC_CHECKPOINT_DIR}"; fi)
+       --critic-ref-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/models/Qwen3-4B-Base-torch_dist
        $(if [ "$USE_RESUME_CRITIC_CHECKPOINT" = true ]; then echo "--critic-load ${RESUME_CRITIC_CHECKPOINT_DIR}"; fi)
        --critic-save ${CRITIC_SAVE_DIR}
        
-       --save-interval 100
+       # Critic2 configuration (second critic model)
+      #  --use-critic2
+      #  --critic2-hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-1.7B-Base
+      #  $(if [ "$USE_RESUME_CRITIC2_CHECKPOINT" = true ]; then echo "--critic2-ref-load ${RESUME_CRITIC2_CHECKPOINT_DIR}"; fi)
+      #  $(if [ "$USE_RESUME_CRITIC2_CHECKPOINT" = true ]; then echo "--critic2-load ${RESUME_CRITIC2_CHECKPOINT_DIR}"; fi)
+      #  --critic2-save ${CRITIC2_SAVE_DIR}
+       
+       --save-interval 200
     )
 else
     CKPT_ARGS=(
@@ -116,17 +140,27 @@ else
        --load /mnt/shared-storage-user/p1-shared/liyizhuo/share/models/Qwen3-4B-Base-torch_dist
        --save ${SAVE_DIR}
 
-       --critic-hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-4B-Base
-       --critic-ref-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-4B-Base-slime_PPO_CriticPretrain/critic
-       --critic-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-4B-Base-slime_PPO_CriticPretrain/critic
+      #  --critic-hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-4B-Base
+      #  --critic-ref-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-4B-Base-slime_PPO_CriticPretrain/critic
+      #  --critic-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-4B-Base-slime_PPO_CriticPretrain/critic
+      #  --critic-save ${CRITIC_SAVE_DIR}
+        --critic-hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-1.7B-Base
+       --critic-ref-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-1_7B-Base-17B_CriticPretrain/critic
+       --critic-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-1_7B-Base-17B_CriticPretrain/critic
        --critic-save ${CRITIC_SAVE_DIR}
+       # Critic2 configuration (second critic model)
+       --use-critic2
+       --critic2-hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-1.7B-Base
+       --critic2-ref-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-1_7B-Base-17B_CriticPretrain/critic
+       --critic2-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-1_7B-Base-17B_CriticPretrain/critic
+       --critic2-save ${CRITIC2_SAVE_DIR}
        
-       --save-interval 100
+       --save-interval 500
     )
 fi
 
 ROLLOUT_ARGS=(
-   # --prompt-data /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/debug2.jsonl
+#    --prompt-data /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/debug2.jsonl
    --prompt-data /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/DAPO-Math-17k/dapo-math-17k.jsonl
    --input-key prompt
    --label-key label
@@ -146,10 +180,11 @@ ROLLOUT_ARGS=(
 )
 
 EVAL_ARGS=(
-   --eval-interval 10
-   # --eval-prompt-data aime24 /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/aime_2024/aime-2024-deepmathformat.jsonl aime25 /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/aime-2025/aime-2025-deepmathformat.jsonl
-   --eval-prompt-data aime24 /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/aime_2024/aime-2024-deepmathformat.jsonl
-   --n-samples-per-eval-prompt 16
+   --eval-interval 20
+   # --eval-prompt-data aime24 /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/aime_2024/aime-2024-deepmathformat.jsonl aime25 /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/aime-2025/aime-2025-deepmathformat.jsonl math500 /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/MATH-500/test-deepmathformat.jsonl  minervamath /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/minervamath/test-deepmathformat.jsonl olympic /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/OlympiadBench/test_deepmathformat_filtered.jsonl
+   --eval-prompt-data aime24 /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/aime_2024/aime-2024-deepmathformat.jsonl aime25 /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/aime-2025/aime-2025-deepmathformat.jsonl math500 /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/MATH-500/test-deepmathformat.jsonl  minervamath /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/minervamath/test-deepmathformat.jsonl
+   # --eval-prompt-data aime24 /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/aime_2024/aime-2024-deepmathformat.jsonl
+   --n-samples-per-eval-prompt 8
    --eval-max-response-len 16384
    --eval-top-p 0.95
    --eval-temperature 0.6
@@ -189,13 +224,21 @@ PPO_ARGS=(
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --kl-coef 0.00
-   --entropy-coef 0.00
+#    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
    --num-critic-only-steps 10
    # --num-critic-only-steps 1
    # --normalize-advantages
    --critic-lr 2e-6
+   --critic-num-nodes 1
+   --critic-num-gpus-per-node 2
+
+
+   # Critic2 configuration (same settings as critic1)
+   --critic2-num-nodes 1
+   --critic2-num-gpus-per-node 2
+   --critic2-lr 2e-6
 )
 
 OPTIMIZER_ARGS=(
@@ -263,15 +306,22 @@ CUSTOM_ARGS=(
    # --alpha 0.05
    --log-position-advantage-stats
    --num-steps-per-rollout 1
-   --use-positive-nll-loss
-   --positive-nll-coef 0.1
-   --positive-reward-threshold 0.0
+   # --use-positive-nll-loss
+   # --positive-nll-coef 0.1
+   # --positive-reward-threshold 0.0
+   --eval-first
    --finetune
+   --no-load-optim
+   --use-asytrain-critic
+   --entropy-coef 0.00
+   --use-advantage-diff-mask
+   --advantage-diff-mask-k 0.2
 )
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=26500
+# 使用 8 GPUs: Actor(2) + Critic1(colocate with actor) + Critic2(2) + Rollout(2-4)
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 6 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=26500
 
 # Build the runtime environment JSON with proper variable substitution
 RUNTIME_ENV_JSON="{
@@ -297,6 +347,8 @@ if [ -z "$RANK" ]; then
   export RANK=0
 fi
 
+
+# ${MODEL_ARGS[@]} \
 # ========= Submit Ray Job (rank 0 only) =========
 if [ "$RANK" == "0" ]; then
    ray job submit --address="http://127.0.0.1:26500" \
@@ -305,7 +357,6 @@ if [ "$RANK" == "0" ]; then
       --actor-num-nodes 1 \
       --actor-num-gpus-per-node 2 \
       --colocate \
-      ${MODEL_ARGS[@]} \
       ${CKPT_ARGS[@]} \
       ${ROLLOUT_ARGS[@]} \
       ${OPTIMIZER_ARGS[@]} \

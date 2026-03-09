@@ -329,7 +329,7 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                     # NOTE: Here we have to do the clone().detach(), otherwise the tensor will be
                     # modified in place and will cause problem for the next rollout.
                     val = torch.cat(val).clone().detach()
-                    if key in ["log_probs", "ref_log_probs", "rollout_log_probs", "returns", "advantages", "values"]:
+                    if key in ["log_probs", "ref_log_probs", "rollout_log_probs", "returns", "advantages", "values","2_values","values_critic1","values_critic2"]:
                         sum_of_sample_mean = get_sum_of_sample_mean(total_lengths, response_lengths, loss_masks)
                         val = cp_size * sum_of_sample_mean(val) / len(loss_masks)
                     else:
@@ -441,49 +441,95 @@ def sync_actor_critic_data(
     args: Namespace,
     rollout_data: RolloutBatch | None = None,
     group: dist.ProcessGroup | None = None,
+    value_key: str = "values",
+    sync_returns: bool = False,
+    sync_log_probs: bool = True,
+    sync_values: bool = True,
 ) -> None:
     """
     Broadcast `values` (from critic) and optionally `log_probs`/`ref_log_probs`
     (from actor) across PP ranks to align data dependencies.
+    
+    When sync_returns=True, also broadcast returns from actor (src=0) to critic (src=1).
+    When sync_log_probs=False, skip broadcasting log_probs (useful for avoiding deadlock).
+    When sync_values=False, skip broadcasting values (useful when actor has modified values).
 
-    - Values are broadcast from src=1.
-    - Log-probs and ref-log-probs are broadcast from src=0 when KL is used.
+    - Values are broadcast from src=1 (if sync_values=True).
+    - Log-probs and ref-log-probs are broadcast from src=0 when KL is used (if sync_log_probs=True).
+    - Returns are broadcast from src=0 when sync_returns=True.
     Updates `rollout_data` in place with the synchronized tensors.
     """
+    from megatron.core import mpu
+    rank = mpu.get_data_parallel_rank(with_context_parallel=True)
+    logger.info(f"[rank {rank}] sync_actor_critic_data: value_key={value_key}, sync_returns={sync_returns}, sync_log_probs={sync_log_probs}")
+    
     log_probs_key = "log_probs" if not args.use_rollout_logprobs else "rollout_log_probs"
-    values, log_probs, ref_log_probs = map(rollout_data.get, ("values", log_probs_key, "ref_log_probs"))
+    values, log_probs, ref_log_probs = map(rollout_data.get, (value_key, log_probs_key, "ref_log_probs"))
+    returns = rollout_data.get("returns") if sync_returns else None
 
     # return when not the pp last stage
-    if not values and not log_probs:
+    if not values and not log_probs and not returns:
+        logger.info(f"[rank {rank}] sync_actor_critic_data: Not PP last stage, returning")
         return
 
     handles = []
 
-    if not values:
-        values = [torch.empty_like(log_prob) for log_prob in log_probs]
-    for value in values:
-        handles.append(dist.broadcast(value, src=1, group=group, async_op=True))
+    # Critic (src=1) -> Actor (src=0): broadcast values
+    if sync_values:
+        if not values:
+            if log_probs:
+                values = [torch.empty_like(log_prob) for log_prob in log_probs]
+                logger.info(f"Warning: No values found, broadcasting log_probs from src=0 to src=1")
+            elif returns:
+                values = [torch.empty_like(ret) for ret in returns]
+                logger.info(f"Warning: No values found, broadcasting returns from src=0 to src=1")
+        if values:
+            logger.info(f"[rank {rank}] sync_actor_critic_data: Broadcasting {len(values)} values from src=1 to src=0")
+            for value in values:
+                handles.append(dist.broadcast(value, src=1, group=group, async_op=True))
+            logger.info(f"[rank {rank}] sync_actor_critic_data: Values broadcast initiated")
+    else:
+        logger.info(f"[rank {rank}] sync_actor_critic_data: Skipping values broadcast (sync_values=False)")
 
-    if args.kl_coef != 0 or args.use_kl_loss:
-        if not log_probs:
+    # Actor (src=0) -> Critic (src=1): broadcast log_probs and ref_log_probs
+    if sync_log_probs and (args.kl_coef != 0 or args.use_kl_loss):
+        logger.info(f"[rank {rank}] sync_actor_critic_data: Broadcasting log_probs from src=0 to src=1")
+        if not log_probs and values:
             log_probs = [torch.empty_like(value) for value in values]
-        if not ref_log_probs:
+        if not ref_log_probs and values:
             ref_log_probs = [torch.empty_like(value) for value in values]
-        for ref_log_prob, log_prob in zip(ref_log_probs, log_probs, strict=False):
-            handles.append(dist.broadcast(log_prob, src=0, group=group, async_op=True))
-            handles.append(dist.broadcast(ref_log_prob, src=0, group=group, async_op=True))
+        if log_probs:
+            for ref_log_prob, log_prob in zip(ref_log_probs, log_probs, strict=False):
+                handles.append(dist.broadcast(log_prob, src=0, group=group, async_op=True))
+                handles.append(dist.broadcast(ref_log_prob, src=0, group=group, async_op=True))
+        logger.info(f"[rank {rank}] sync_actor_critic_data: Log_probs broadcast initiated")
 
+    # Actor (src=0) -> Critic (src=1): broadcast returns
+    if sync_returns:
+        logger.info(f"[rank {rank}] sync_actor_critic_data: Broadcasting returns from src=0 to src=1")
+        if not returns and values:
+            returns = [torch.empty_like(value) for value in values]
+        if returns:
+            for ret in returns:
+                handles.append(dist.broadcast(ret, src=0, group=group, async_op=True))
+        logger.info(f"[rank {rank}] sync_actor_critic_data: Returns broadcast initiated")
+
+    logger.info(f"[rank {rank}] sync_actor_critic_data: Waiting for {len(handles)} handles to complete")
     for handle in handles:
         handle.wait()
+    logger.info(f"[rank {rank}] sync_actor_critic_data: All sync operations completed")
 
-    rollout_data.update(
-        {
-            k: v
-            for k, v in {
-                "values": values,
-                log_probs_key: log_probs,
-                "ref_log_probs": ref_log_probs,
-            }.items()
-            if v is not None
-        }
-    )
+    update_dict = {
+        k: v
+        for k, v in {
+            value_key: values if sync_values else None,
+            log_probs_key: log_probs,
+            "ref_log_probs": ref_log_probs,
+        }.items()
+        if v is not None
+    }
+    
+    if sync_returns and returns:
+        update_dict["returns"] = returns
+
+    rollout_data.update(update_dict)

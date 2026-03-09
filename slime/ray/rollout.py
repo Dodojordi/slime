@@ -560,21 +560,128 @@ def _start_router(args, prefill_and_decode_urls=None):
     logger.info(f"Router launched at {args.sglang_router_ip}:{args.sglang_router_port}")
 
 
+# def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] | None = None):
+#     log_dict = extra_metrics or {}
+    
+#     # 构建数据集名称到 n_samples_per_eval_prompt 的映射
+#     def get_group_size(dataset_name: str):
+#         # 首先尝试从 eval_datasets 中查找
+#         if hasattr(args, 'eval_datasets') and args.eval_datasets:
+#             for dataset in args.eval_datasets:
+#                 if dataset.name == dataset_name and dataset.n_samples_per_eval_prompt is not None:
+#                     return dataset.n_samples_per_eval_prompt
+        
+#         # 如果找不到，回退到 args.n_samples_per_eval_prompt
+#         if isinstance(args.n_samples_per_eval_prompt, list):
+#             if len(args.n_samples_per_eval_prompt) > 0:
+#                 return args.n_samples_per_eval_prompt[0]
+#             else:
+#                 return 1  # 默认值
+#         return args.n_samples_per_eval_prompt
+    
+#     for key in data.keys():
+#         rewards = data[key]["rewards"]
+#         log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
+#         if (samples := data[key].get("samples")) is not None:
+#             log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
+#         if "truncated" in data[key]:
+#             truncated = data[key]["truncated"]
+#             log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
+#         if args.log_passrate:
+#             group_size = get_group_size(key)  # 为每个数据集获取对应的 group_size
+#             log_dict |= dict_add_prefix(
+#                 compute_pass_rate(
+#                     flat_rewards=rewards,
+#                     group_size=group_size,
+#                 ),
+#                 f"eval/{key}-",
+#             )
+
+#     logger.info(f"eval {rollout_id}: {log_dict}")
+
+#     step = compute_rollout_step(args, rollout_id)
+#     log_dict["eval/step"] = step
+#     tracking_utils.log(args, log_dict, step_key="eval/step")
+
+#     return log_dict
+
+
 def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] | None = None):
     log_dict = extra_metrics or {}
-    for key in data.keys():
+    
+    # 构建数据集名称到 n_samples_per_eval_prompt 的映射
+    def get_group_size(dataset_name: str):
+        # 首先尝试从 eval_datasets 中查找
+        if hasattr(args, 'eval_datasets') and args.eval_datasets:
+            for dataset in args.eval_datasets:
+                if dataset.name == dataset_name and dataset.n_samples_per_eval_prompt is not None:
+                    return dataset.n_samples_per_eval_prompt
+        
+        # 如果找不到，回退到 args.n_samples_per_eval_prompt
+        if isinstance(args.n_samples_per_eval_prompt, list):
+            if len(args.n_samples_per_eval_prompt) > 0:
+                return args.n_samples_per_eval_prompt[0]
+            else:
+                return 1  # 默认值
+        return args.n_samples_per_eval_prompt
+    
+    # Helper function to get n_samples for a specific dataset
+    def get_n_samples_for_dataset(dataset_key, dataset_index):
+        # 优先使用 data 中的 n_samples_per_prompt
+        if dataset_key in data and "n_samples_per_prompt" in data[dataset_key]:
+            return data[dataset_key]["n_samples_per_prompt"]
+        
+        # 回退到 args 中的配置
+        if isinstance(args.n_samples_per_eval_prompt, int):
+            return args.n_samples_per_eval_prompt
+        elif isinstance(args.n_samples_per_eval_prompt, list):
+            if len(args.n_samples_per_eval_prompt) == 1:
+                return args.n_samples_per_eval_prompt[0]
+            elif dataset_index < len(args.n_samples_per_eval_prompt):
+                return args.n_samples_per_eval_prompt[dataset_index]
+            else:
+                return args.n_samples_per_eval_prompt[0] if args.n_samples_per_eval_prompt else 1
+        else:
+            return 1  # 默认值
+    
+    for idx, key in enumerate(data.keys()):
         rewards = data[key]["rewards"]
         log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
+        
+        # 获取该数据集的 n_samples_per_prompt
+        n_samples_for_dataset = get_n_samples_for_dataset(key, idx)
+        
+        # 记录 scores（如果有）
+        if "scores" in data[key]:
+            scores = data[key]["scores"]
+            log_dict[f"eval/{key}-score"] = sum(scores) / n_samples_for_dataset
+        
+        # 记录 points（如果有）
+        if "points" in data[key]:
+            points = data[key]["points"]
+            log_dict[f"eval/{key}-point"] = sum(points) / n_samples_for_dataset
+        
+        # 记录 scores_noxverify（如果有）
+        if "scores_noxverify" in data[key]:
+            scores_noxverify = data[key]["scores_noxverify"]
+            log_dict[f"eval/{key}-score_noxverify"] = sum(scores_noxverify) / n_samples_for_dataset
+        
+        # 记录 points_noxverify（如果有）
+        if "points_noxverify" in data[key]:
+            points_noxverify = data[key]["points_noxverify"]
+            log_dict[f"eval/{key}-point_noxverify"] = sum(points_noxverify) / n_samples_for_dataset
+        
         if (samples := data[key].get("samples")) is not None:
             log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
         if "truncated" in data[key]:
             truncated = data[key]["truncated"]
             log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
         if args.log_passrate:
+            group_size = get_group_size(key)  # 为每个数据集获取对应的 group_size
             log_dict |= dict_add_prefix(
                 compute_pass_rate(
                     flat_rewards=rewards,
-                    group_size=args.n_samples_per_eval_prompt,
+                    group_size=group_size,
                 ),
                 f"eval/{key}-",
             )
@@ -586,7 +693,6 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
     tracking_utils.log(args, log_dict, step_key="eval/step")
 
     return log_dict
-
 
 def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
     if args.load_debug_rollout_data:

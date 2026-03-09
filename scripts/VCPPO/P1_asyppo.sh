@@ -1,19 +1,40 @@
 #!/bin/bash
 
-# for rerun the task
-pkill -9 sglang
-sleep 3
-ray stop --force
-pkill -9 ray
-pkill -9 python
-sleep 3
-pkill -9 ray
-pkill -9 python
+# for rerun the task (仅在重新运行时取消注释)
+# pkill -9 sglang
+# sleep 3
+# ray stop --force
+# pkill -9 ray
+# pkill -9 python
+# sleep 3
+# pkill -9 ray
+# pkill -9 python
 
 set -ex
 
 # will prevent ray from buffering stdout/stderr
 export PYTHONBUFFERED=16
+
+# Multi-node environment (defaults for single-node if not provided)
+export RANK=${NODE_RANK:-0}
+export NODE_COUNT=${KUBEBRAIN_REPLICA_TOTAL:-1}
+export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
+export PROC_PER_NODE=${PROC_PER_NODE:-8}
+
+# ========== 角色识别与 MASTER_ADDR 设置 ==========
+if [ -z "$RANK" ]; then
+  echo "RANK not set. Please set RANK=0 for master, RANK=1,2,... for workers"
+  exit 1  # ✅ 强制要求，不要默认值
+fi
+
+echo "Multi-node configuration:"
+echo "  RANK: $RANK"
+echo "  NODE_COUNT: $NODE_COUNT"
+echo "  MASTER_ADDR: $MASTER_ADDR"
+echo "  PROC_PER_NODE: $PROC_PER_NODE"
+
+SHARED_DIR="/mnt/shared-storage-user/p1-shared/liyizhuo"
+READY_FLAG_FILE="$SHARED_DIR/ray_head_ready_asyppo"
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 if [ "$NVLINK_COUNT" -gt 0 ]; then
@@ -25,20 +46,20 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 EXP_NAME="${EXP_NAME:-exp_$(date +%Y%m%d_%H%M%S)}"
 # EXP_NAME="verify_lambd_adaptive_0.05"
 # EXP_NAME="1_7BCritic+WARMUP+32*4"  # Single critic
-EXP_NAME="ADEBUG-4bsftv2_doublecritic1.7b-32*4-64k-utd2-xverify"  # Double critic configuration
+EXP_NAME="4bsftv2_doublecritic1.7b-32*4-64k-utd2-xverify-try"  # Double critic configuration
 # EXP_NAME="?????"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # source "${SCRIPT_DIR}/models/qwen3-4B.sh"
 SAVE_DIR="/mnt/shared-storage-user/p1-shared/liyizhuo/share/save/P1_PPO/Qwen3-1_7B-Base-${EXP_NAME}/"
 CRITIC_SAVE_DIR="${SAVE_DIR}/critic"
 CRITIC2_SAVE_DIR="${SAVE_DIR}/critic2"
-TP_SIZE=2
+TP_SIZE=4
 PP_SIZE=1
 CP_SIZE=1
 EP_SIZE=1
 ETP_SIZE=1
-MAX_LEN=$((1024 * 40))
-MAX_TOKENS_PER_GPU=$((($MAX_LEN / $CP_SIZE) + 1024))
+MAX_LEN=$((1024 * 64))
+MAX_TOKENS_PER_GPU=$((($MAX_LEN / $CP_SIZE) + 128))
 ROLLOUT_BATCH_SIZE=32
 N_SAMPLES_PER_PROMPT=4
 NUM_STEPS_PER_ROLLOUT=2
@@ -128,7 +149,7 @@ else
        --critic2-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-1_7B-Base-17B_CriticPretrain/critic
        --critic2-save ${CRITIC2_SAVE_DIR}
        
-       --save-interval 1000
+       --save-interval 20
     )
 fi
 
@@ -169,6 +190,9 @@ EVAL_ARGS=(
    --eval-top-p 0.95
    --eval-temperature 1.0
    --log-passrate
+   --eval-use-xverify
+   # --eval-group
+   --train-use-xverify
 )
 
 PERF_ARGS=(
@@ -204,7 +228,7 @@ PERF_ARGS=(
 
 PPO_ARGS=(
    --advantage-estimator ppo
-   # --use-kl-loss
+   --use-kl-loss
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --kl-coef 0.00
@@ -215,13 +239,13 @@ PPO_ARGS=(
    # --num-critic-only-steps 1
    # --normalize-advantages
    --critic-lr 4e-6
-   --critic-num-nodes 1
-   --critic-num-gpus-per-node 2
+   # --critic-num-nodes 1
+   # --critic-num-gpus-per-node 2
 
 
    # Critic2 configuration (same settings as critic1)
-   --critic2-num-nodes 1
-   --critic2-num-gpus-per-node 2
+   # --critic2-num-nodes 1
+   # --critic2-num-gpus-per-node 2
    --critic2-lr 4e-6
 )
 
@@ -262,6 +286,7 @@ SGLANG_ARGS=(
    --sglang-speculative-draft-model-path /mnt/shared-storage-user/p1-shared/leihaodi/spec_decode/draft-model/Qwen3-4B-Eagle3-Zjcxy-SmartAI
 )
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+
 MISC_ARGS=(
    # default dropout in megatron is 0.1
    --attention-dropout 0.0
@@ -315,25 +340,76 @@ CUSTOM_ARGS=(
 #    --critic-num-nodes 1
 #    --critic2-num-gpus-per-node 2
 #    --critic2-num-nodes 1
-   --eval-use-xverify
-   # --eval-group
-   --log-probs-chunk-size 8192
-   --train-use-xverify
-   # --eval-log-dir ${DEBUG_DIR}/eval
-   # --start-rollout-id 0
 )
 
-# launch the master node of ray in container
-export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-# 使用 8 GPUs: Actor(2) + Critic1(colocate with actor) + Critic2(2) + Rollout(2-4)
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 6 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=26500
+# ========= 启动 Ray（多机支持）=========
+if [ "$RANK" == "0" ]; then
+  # 清理旧的标志文件
+  if [ -f "$READY_FLAG_FILE" ]; then
+    rm -f "$READY_FLAG_FILE"
+  fi
+  
+  echo "[RANK 0] Starting Ray Head node..."
+  # 使用 12 GPUs: Actor(4) + Critic1(2) + Critic2(2) + Rollout(2-4)
+  ray start --head \
+    --port=6379 \
+    --node-ip-address=${MASTER_ADDR} \
+    --num-gpus=${PROC_PER_NODE} \
+    --disable-usage-stats \
+    --dashboard-host=0.0.0.0 \
+    --dashboard-port=8265
+  
+  echo "[RANK 0] Ray Head started successfully."
+  touch "$READY_FLAG_FILE"
+else
+  echo "[RANK $RANK] Waiting for Ray Head to be ready..."
+  sleep 10
+  
+  MAX_WAIT=120
+  elapsed=0
+  while [ ! -f "$READY_FLAG_FILE" ] && [ $elapsed -lt $MAX_WAIT ]; do
+    echo "  ⏳ Still waiting... ($elapsed/$MAX_WAIT)"
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+  
+  if [ ! -f "$READY_FLAG_FILE" ]; then
+    echo "❌ Timed out waiting for Ray Head to be ready."
+    exit 1
+  fi
+  
+  WORKER_IP=$(hostname -I | awk '{print $1}')
+  MASTER_IP=$(getent hosts $MASTER_ADDR 2>/dev/null | awk '{print $1}' | head -1)
+if [ -z "$MASTER_IP" ]; then
+  # 如果 DNS 解析失败，尝试从环境变量获取
+  MASTER_IP=$(echo $MASTER_ADDR | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' || echo $MASTER_ADDR)
+  echo "[RANK $RANK] ⚠️  Cannot resolve hostname, using: $MASTER_IP"
+else
+  echo "[RANK $RANK] ✅ Resolved $MASTER_ADDR to $MASTER_IP"
+fi
+echo "[RANK $RANK] Detected Ray Head at $MASTER_ADDR ($MASTER_IP), starting worker at $WORKER_IP..."
+
+  echo "[RANK $RANK] Detected Ray Head at $MASTER_ADDR, starting worker at $WORKER_IP..."
+  ray start \
+    --address=$MASTER_ADDR:6379 \
+    --node-ip-address=$WORKER_IP \
+    --num-gpus=${PROC_PER_NODE} \
+    --disable-usage-stats \
+    --block
+  echo "[RANK $RANK] Worker started successfully."
+fi
+
+wait
 
 # Build the runtime environment JSON with proper variable substitution
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
     \"PYTHONPATH\": \"/root/Megatron-LM/\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
+    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
+    \"MASTER_ADDR\": \"${MASTER_ADDR}\",
+    \"NCCL_TIMEOUT_MS\": \"36000000\",
+    \"PYTORCH_ALLOC_CONF\": \"max_split_size_mb:2048\"
   }
 }"
 
@@ -342,25 +418,40 @@ mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/${EXP_NAME}.log"
 echo "Log file will be saved to: ${LOG_FILE}"
 
-export RANK=${NODE_RANK:-0}
-export NODE_COUNT=${KUBEBRAIN_REPLICA_TOTAL:-1}
-export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-export PROC_PER_NODE=${PROC_PER_NODE:-8}
-
-if [ -z "$RANK" ]; then
-  echo "RANK not set. Defaulting to RANK=0 for single node"
-  export RANK=0
-fi
-
-
-# ${MODEL_ARGS[@]} \
-# ========= Submit Ray Job (rank 0 only) =========
+# ========= 仅主节点提交 Ray Job =========
+# if [ "$RANK" == "0" ]; then
+#    echo "[RANK 0] Submitting Ray job..."
+#    ray job submit --address="http://127.0.0.1:8265" \
+#       --runtime-env-json="${RUNTIME_ENV_JSON}" \
+#       -- python3 train.py \
+#       --actor-num-nodes ${NODE_COUNT} \
+#       --actor-num-gpus-per-node 2 \
+#       --num-gpus-per-node ${PROC_PER_NODE} \
+#       --colocate \
+#       ${CKPT_ARGS[@]} \
+#       ${ROLLOUT_ARGS[@]} \
+#       ${OPTIMIZER_ARGS[@]} \
+#       ${PPO_ARGS[@]} \
+#       ${WANDB_ARGS[@]} \
+#       ${PERF_ARGS[@]} \
+#       ${EVAL_ARGS[@]} \
+#       ${SGLANG_ARGS[@]} \
+#       ${DEBUG_ARGS[@]} \
+#       ${CUSTOM_ARGS[@]} \
+#       ${MISC_ARGS[@]} 2>&1 | tee -a "${LOG_FILE}"
+# else
+#    echo "[RANK $RANK] Worker node, waiting for job completion..."
+#    # Worker 节点保持运行状态，等待 Ray job 完成
+#    wait
+# fi
 if [ "$RANK" == "0" ]; then
-   ray job submit --address="http://127.0.0.1:26500" \
+   echo "[RANK 0] Submitting Ray job..."
+   ray job submit --address="http://127.0.0.1:8265" \
       --runtime-env-json="${RUNTIME_ENV_JSON}" \
       -- python3 train.py \
-      --actor-num-nodes 1 \
+      --actor-num-nodes 2 \
       --actor-num-gpus-per-node 2 \
+      --num-gpus-per-node ${PROC_PER_NODE} \
       --colocate \
       ${CKPT_ARGS[@]} \
       ${ROLLOUT_ARGS[@]} \
@@ -373,4 +464,8 @@ if [ "$RANK" == "0" ]; then
       ${DEBUG_ARGS[@]} \
       ${CUSTOM_ARGS[@]} \
       ${MISC_ARGS[@]} 2>&1 | tee -a "${LOG_FILE}"
+else
+   echo "[RANK $RANK] Worker node, waiting for job completion..."
+   # Worker 节点保持运行状态，等待 Ray job 完成
+   wait
 fi

@@ -155,7 +155,8 @@ def get_model_provider_func(
         with build_model_context(**build_model_context_args):
             model = GPTModel(**kwargs)
 
-        if post_process and role == "critic":
+        # 为所有 critic 模型（包括 critic2）替换输出层为 value head
+        if post_process and (role == "critic" or role == "critic2"):
             model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
 
         return model

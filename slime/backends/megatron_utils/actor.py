@@ -75,6 +75,33 @@ class MegatronTrainRayActor(TrainRayActor):
                     setattr(args, key, value)
             # 更新 hf_checkpoint 指向 critic 的
             args.hf_checkpoint = args.critic_hf_checkpoint
+        
+        # === 新增：如果 critic2 使用不同的 hf_checkpoint，需要重新应用配置 ===
+        if role == "critic2":
+            # 如果未指定 critic2_hf_checkpoint，回退使用 critic_hf_checkpoint
+            critic2_hf_checkpoint_to_use = (
+                args.critic2_hf_checkpoint if (hasattr(args, 'critic2_hf_checkpoint') and args.critic2_hf_checkpoint is not None)
+                else (args.critic_hf_checkpoint if hasattr(args, 'critic_hf_checkpoint') else args.hf_checkpoint)
+            )
+            
+            if (
+                critic2_hf_checkpoint_to_use != args.hf_checkpoint
+                and hasattr(args, "use_hf_config_for_megatron")
+                and args.use_hf_config_for_megatron
+            ):
+                logger.info(f"Reapplying HF config for critic2 from {critic2_hf_checkpoint_to_use}")
+                from slime.backends.megatron_utils.config_mapping import get_mapper
+                
+                critic2_hf_config = AutoConfig.from_pretrained(critic2_hf_checkpoint_to_use, trust_remote_code=True)
+                if args.use_hf_config_for_megatron:
+                    megatron_config_from_hf = get_mapper(critic2_hf_config.model_type)(critic2_hf_config)
+                    # 覆盖模型架构参数
+                    for key, value in megatron_config_from_hf.transformer_config.items():
+                        setattr(args, key, value)
+                    for key, value in megatron_config_from_hf.gpt_model_args.items():
+                        setattr(args, key, value)
+                # 更新 hf_checkpoint 指向 critic2 的
+                args.hf_checkpoint = critic2_hf_checkpoint_to_use
         # === 新增结束 ===
 
         init(args)
@@ -136,12 +163,80 @@ class MegatronTrainRayActor(TrainRayActor):
                     # critic_load 有效，直接使用
                     logger.info(f"Loading critic from valid checkpoint: {self.args.critic_load}")
                     self.args.load = self.args.critic_load
-
+        elif role == "critic2":
+            # 为所有 critic2 参数设置回退逻辑，如果未指定则使用 critic1 的值
+            
+            # Checkpoint 路径参数
+            self.args.load = (
+                self.args.critic2_ref_load if self.args.critic2_ref_load is not None 
+                else self.args.critic_ref_load
+            )
+            self.args.save = (
+                self.args.critic2_save if self.args.critic2_save is not None 
+                else self.args.critic_save
+            )
+            
+            # 学习率参数
+            self.args.lr = (
+                self.args.critic2_lr if self.args.critic2_lr is not None 
+                else self.args.critic_lr
+            )
+            self.args.lr_warmup_iters = (
+                self.args.critic2_lr_warmup_iters if self.args.critic2_lr_warmup_iters is not None 
+                else self.args.lr_warmup_iters
+            )
+            if hasattr(args, 'use_asyppo') and args.use_asyppo:
+                # 获取 critic2_load，如果未指定则使用 critic_load
+                critic2_load_to_check = (
+                    self.args.critic2_load if self.args.critic2_load is not None 
+                    else self.args.critic_load
+                )
+                
+                # 检查 critic2_load 是否为有效的 Megatron checkpoint
+                critic_load_valid = (
+                    critic2_load_to_check is not None
+                    and os.path.exists(critic2_load_to_check)
+                    and os.path.exists(os.path.join(critic2_load_to_check, "latest_checkpointed_iteration.txt"))
+                )
+                
+                if not critic_load_valid:
+                    # critic2_load 无效，尝试回退到 critic2_ref_load 或 critic_ref_load
+                    ref_load_to_use = (
+                        args.critic2_ref_load if (hasattr(args, 'critic2_ref_load') and args.critic2_ref_load)
+                        else args.critic_ref_load
+                    )
+                    
+                    if ref_load_to_use:
+                        logger.info(
+                            f"critic2_load '{critic2_load_to_check}' is not a valid Megatron checkpoint. "
+                            f"Falling back to ref_load: {ref_load_to_use}"
+                        )
+                        self.args.load = ref_load_to_use
+                        self.args.no_load_optim = True
+                        self.args.no_load_rng = True
+                        self.args.finetune = True
+                    else:
+                        # 如果也没有 ref_load，回退到 args.ref_load
+                        logger.warning(
+                            f"critic2_load '{critic2_load_to_check}' is not valid and no critic2_ref_load/critic_ref_load specified. "
+                            f"Falling back to args.ref_load: {args.ref_load}"
+                        )
+                        self.args.load = args.ref_load
+                        self.args.no_load_optim = True
+                        self.args.no_load_rng = True
+                        self.args.finetune = True
+                else:
+                    # critic2_load 有效，直接使用
+                    logger.info(f"Loading critic2 from valid checkpoint: {critic2_load_to_check}")
+                    self.args.load = critic2_load_to_check
         (self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id) = initialize_model_and_optimizer(
             args, role
         )
 
-        if role == "critic":
+        if role == "critic" or role == "critic2":
+            # 初始化 critic 的待处理训练状态（用于三阶段训练）
+            self._critic_train_pending = None
+            
             if self.args.offload_train:
                 self.sleep()
             return
@@ -373,7 +468,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 log_rollout_data(rollout_id, self.args, rollout_data)
                 return
 
-        if self.role == "critic":
+        if self.role == "critic" or self.role == "critic2":
             return self.train_critic(rollout_id, rollout_data)
         else:
             return self.train_actor(rollout_id, rollout_data)
@@ -381,6 +476,15 @@ class MegatronTrainRayActor(TrainRayActor):
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+        
+        # 根据阶段和 role 决定使用的 store_prefix
+        # critic-only 阶段：所有 critics 都使用标准的 "values" key（需要独立训练）
+        # 正常训练阶段：critic2 使用 "2_values" key（与 Actor 协作，避免覆盖）
+        if self.role == "critic2" and rollout_id >= self.args.num_critic_only_steps:
+            store_prefix = "2_"  # Critic2 在正常训练阶段写入 "2_values"
+        else:
+            store_prefix = ""    # critic-only 阶段或 critic1 写入 "values"
+        
         rollout_data.update(
             forward_only(
                 get_values,
@@ -388,66 +492,48 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.model,
                 data_iterator,
                 num_microbatches,
+                store_prefix=store_prefix,
             )
         )
-        
-        # ============ 新增：统计position-value关系 ============
-        # if getattr(self.args, 'log_position_value_stats', False) and "values" in rollout_data:
-        #     # 只在最后一个pipeline stage记录（与model.py中的logging保持一致）
-        #     if (
-        #         mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-        #         and mpu.get_tensor_model_parallel_rank() == 0
-        #         and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
-        #     ):
-        #         import numpy as np
-        #         from slime.utils import tracking_utils
+        # ==================== 新增：设置异步Critic训练的样本标记 ====================
+        if self.args.use_asytrain_critic and self.args.use_critic2:
+            if "sample_indices" in rollout_data:
+                sample_indices = rollout_data["sample_indices"]
+                n_samples_per_prompt = self.args.n_samples_per_prompt
+                samples_per_critic = n_samples_per_prompt // 2
                 
-        #         # 计算训练步数（与model.py中保持一致）
-        #         num_steps_per_rollout = len(num_microbatches)
-        #         # 这里用rollout的起始step_id，即rollout_id * num_steps_per_rollout
-        #         accumulated_step_id = rollout_id * num_steps_per_rollout
+                # 根据当前critic的role创建训练标记
+                asy_critic_train_mask = []
                 
-        #         # 统计每个position的value
-        #         position_value_stats = {}  # {position: list of values}
-                
-        #         for values_tensor in rollout_data["values"]:
-        #             # values_tensor 的形状是 [response_length]
-        #             for pos, val in enumerate(values_tensor.tolist()):
-        #                 if pos not in position_value_stats:
-        #                     position_value_stats[pos] = []
-        #                 position_value_stats[pos].append(val)
-                
-        #         # 计算每个position的平均value并记录
-        #         log_dict = {}
-        #         max_position = max(position_value_stats.keys()) if position_value_stats else 0
-                
-        #         max_log_positions = getattr(self.args, 'max_log_positions', 50)
-        #         for pos in sorted(position_value_stats.keys())[:max_log_positions]:
-        #             vals = np.array(position_value_stats[pos])
-        #             # 只记录平均值
-        #             log_dict[f"critic/value_pos_{pos}_mean"] = float(vals.mean())
+                for idx in sample_indices:
+                    position_in_group = idx % n_samples_per_prompt
                     
-        #             # 可选：如果需要更多统计信息，可以取消下面的注释
-        #             # log_dict[f"critic/value_pos_{pos}_std"] = float(vals.std())
-        #             # log_dict[f"critic/value_pos_{pos}_count"] = len(vals)
+                    if self.role == "critic":
+                        # Critic1训练前半部分样本 (positions 0, 1, ...)
+                        should_train = 1 if position_in_group < samples_per_critic else 0
+                    elif self.role == "critic2":
+                        # Critic2训练后半部分样本 (positions 2, 3, ...)
+                        should_train = 1 if position_in_group >= samples_per_critic else 0
+                    else:
+                        # 其他情况（如果有的话），默认训练所有样本
+                        should_train = 1
+                    
+                    asy_critic_train_mask.append(should_train)
                 
-        #         # 额外记录一些元信息
-        #         log_dict["critic/max_position"] = max_position
-        #         log_dict["critic/num_samples"] = len(rollout_data["values"])
-        #         log_dict["train/step"] = accumulated_step_id
+                # 存储到rollout_data中
+                rollout_data["asy_critic_train_mask"] = asy_critic_train_mask
                 
-        #         # 使用tracking_utils记录
-        #         tracking_utils.log(self.args, log_dict, step_key="train/step")
+                num_train_samples = sum(asy_critic_train_mask)
+                num_total_samples = len(sample_indices)
                 
-        #         # 格式化输出position-value统计信息
-        #         position_stats_str = ", ".join([
-        #             f"pos_{pos}={log_dict[f'critic/value_pos_{pos}_mean']:.4f}" 
-        #             for pos in sorted(position_value_stats.keys())[:max_log_positions]
-        #         ])
-        #         logger.info(f"Position-Value Stats at step {accumulated_step_id}: "
-        #                 f"max_pos={max_position}, num_samples={len(rollout_data['values'])}")
-        #         logger.info(f"Position-wise mean values: {position_stats_str}")
-        
+                logger.info(f"[{self.role}] Rollout {rollout_id}: Set asy_critic_train_mask: "
+                        f"training on {num_train_samples}/{num_total_samples} samples "
+                        f"(positions: {'0-' + str(samples_per_critic-1) if self.role == 'critic' else str(samples_per_critic) + '-' + str(n_samples_per_prompt-1)})")
+            else:
+                logger.warning(f"[{self.role}] Rollout {rollout_id}: sample_indices not found, "
+                            "skipping asy_critic_train_mask setup")
+        # ==================== 结束：设置异步Critic训练的样本标记 ====================
+   
         if getattr(self.args, 'log_position_value_stats', False) and "values" in rollout_data:
             # 只在最后一个pipeline stage记录（与model.py中的logging保持一致）
             if (
@@ -479,48 +565,118 @@ class MegatronTrainRayActor(TrainRayActor):
                 # 4. 批量计算每个位置的均值（忽略 padding 的 nan）
                 means = torch.nanmean(sliced_values, dim=0)  # [target_len]
                 
-                # 5. 构建 log_dict（保持原有格式）
+                # 5. 构建 log_dict（根据 role 区分前缀）
+                # 为 critic2 使用不同的前缀，避免与 critic1 的指标混淆
+                metric_prefix = "critic2" if self.role == "critic2" else "critic"
+                
                 log_dict = {}
                 # 只记录有有效数据的位置（非 nan 的位置）
                 valid_positions = []
                 for pos in range(target_len):
                     mean_val = float(means[pos].item())
                     if not torch.isnan(means[pos]):
-                        log_dict[f"critic/value_pos_{pos}_mean"] = mean_val
+                        log_dict[f"{metric_prefix}/value_pos_{pos}_mean"] = mean_val
                         valid_positions.append(pos)
                 
-                # 额外记录一些元信息（保持原有格式）
-                log_dict["critic/max_position"] = max_position
-                log_dict["critic/num_samples"] = len(rollout_data["values"])
+                # 额外记录一些元信息（根据 role 区分）
+                log_dict[f"{metric_prefix}/max_position"] = max_position
+                log_dict[f"{metric_prefix}/num_samples"] = len(rollout_data["values"])
                 log_dict["train/step"] = accumulated_step_id
                 
                 # 使用tracking_utils记录
                 tracking_utils.log(self.args, log_dict, step_key="train/step")
                 
-                # 格式化输出position-value统计信息（保持原有格式）
+                # 格式化输出position-value统计信息（添加 role 标识）
                 position_stats_str = ", ".join([
-                    f"pos_{pos}={log_dict[f'critic/value_pos_{pos}_mean']:.4f}" 
+                    f"pos_{pos}={log_dict[f'{metric_prefix}/value_pos_{pos}_mean']:.4f}" 
                     for pos in valid_positions
                 ])
-                logger.info(f"Position-Value Stats at step {accumulated_step_id}: "
+                logger.info(f"[{self.role}] Position-Value Stats at step {accumulated_step_id}: "
                         f"max_pos={max_position}, num_samples={len(rollout_data['values'])}")
-                logger.info(f"Position-wise mean values: {position_stats_str}")
+                logger.info(f"[{self.role}] Position-wise mean values: {position_stats_str}")
         
         # ============ 结束：统计position-value关系 ============
+        # Stage 1: 只保存状态，不进行任何同步（避免死锁）
         if rollout_id >= self.args.num_critic_only_steps:
-            sync_actor_critic_data(self.args, rollout_data, self._actor_critic_groups)
-        # sync_actor_critic_data(self.args, rollout_data, self._actor_critic_groups)
-        compute_advantages_and_returns(self.args, rollout_data)
-
+            logger.info(f"[{self.role}] Saving training state for later completion")
+            # 保存训练状态，等待 Actor 计算 returns 后再继续
+            # 不在这里调用 sync，因为 Actor 还没启动，会导致死锁
+            self._critic_train_pending = {
+                'rollout_id': rollout_id,
+                'rollout_data': rollout_data,
+                'data_iterator': data_iterator,
+                'num_microbatches': num_microbatches
+            }
+            logger.info(f"[{self.role}] Training state saved, returning immediately") 
+            return  # ← 立即返回，让 Actor 可以启动
+        
+        # Critic-only 步骤：直接训练（不需要 Actor）
+        else:
+            # Critic-only 阶段：Critic 独立运行，自己计算 returns
+            # 不需要和 Actor 通信，因为 Actor 不参与训练
+            compute_advantages_and_returns(self.args, rollout_data)
+            
+            self.args.loss_type = "value_loss"
+            with timer("critic_train"):
+                train(
+                    rollout_id,
+                    self.model,
+                    self.optimizer,
+                    self.opt_param_scheduler,
+                    data_iterator,
+                    num_microbatches,
+                )
+            
+            self.prof.step(rollout_id=rollout_id)
+            train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data, role=self.role)
+            log_perf_data(rollout_id, self.args)
+    
+    def train_critic_with_returns(self) -> None:
+        """Stage 2/3: 与 Actor 同步并完成 critic 训练"""
+        logger.info(f"[{self.role}] train_critic_with_returns called")
+        if self._critic_train_pending is None:
+            logger.info(f"[{self.role}] No training state to resume")
+            return
+        logger.info(f"[{self.role}] Training state found, resuming training")
+        # 恢复保存的训练状态
+        data = self._critic_train_pending
+        rollout_id = data['rollout_id']
+        rollout_data = data['rollout_data']
+        data_iterator = data['data_iterator']
+        num_microbatches = data['num_microbatches']
+        logger.info(f"[{self.role}] Restored training state for rollout {rollout_id}") 
+        
+        logger.info(f"[{self.role}] Stage 2: Sending values to Actor (sync_returns=False, sync_log_probs=False)")  # ← 新增
+        # Stage 2: 发送 values 给 Actor（不等待 returns 和 log_probs，避免死锁）
+        if self.role == "critic2":
+            sync_actor_critic_data(self.args, rollout_data, self._actor_critic2_groups, 
+                                value_key="2_values", sync_returns=False, sync_log_probs=False)
+        else:
+            sync_actor_critic_data(self.args, rollout_data, self._actor_critic_groups, 
+                                sync_returns=False, sync_log_probs=False)
+        
+        logger.info(f"[{self.role}] Stage 2 completed: Values sent to Actor")
+        
+        logger.info(f"[{self.role}] Stage 3: Receiving returns from Actor (sync_returns=True)")
+        # Stage 3: 接收 Actor 计算的 returns
+        if self.role == "critic2":
+            sync_actor_critic_data(self.args, rollout_data, self._actor_critic2_groups, 
+                                value_key="2_values", sync_returns=True, sync_values=False)
+        else:
+            sync_actor_critic_data(self.args, rollout_data, self._actor_critic_groups, 
+                                sync_returns=True, sync_values=False)
+        logger.info(f"[{self.role}] Stage 3 completed: Returns received from Actor") 
+        
+        # 重要：对于 critic2，需要将 "2_values" 映射为 "values"
+        # 因为 loss_function 期望读取 "values" key
+        # 此时 critic2 在自己的进程中训练，不会与 critic1 冲突
+        if self.role == "critic2" and "2_values" in rollout_data:
+            logger.info(f"[{self.role}] Mapping '2_values' to 'values' for training")
+            rollout_data["values"] = rollout_data["2_values"]
+        
+        # 完成 critic 训练
+        logger.info(f"[{self.role}] Rollout {rollout_id}: Starting critic training")
         self.args.loss_type = "value_loss"
-        # train(
-        #     rollout_id,
-        #     self.model,
-        #     self.optimizer,
-        #     self.opt_param_scheduler,
-        #     data_iterator,
-        #     num_microbatches,
-        # )
         with timer("critic_train"):
             train(
                 rollout_id,
@@ -530,16 +686,21 @@ class MegatronTrainRayActor(TrainRayActor):
                 data_iterator,
                 num_microbatches,
             )
-        # --- end 计时critic训练 ---
-
-        # 也做profiler记录
+        
+        logger.info(f"[{self.role}] Rollout {rollout_id}: Critic training completed")
+        
         self.prof.step(rollout_id=rollout_id)
-
-        train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
+        train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data, role=self.role)
 
         log_perf_data(rollout_id, self.args)
+        
+        # 清除待处理状态
+        self._critic_train_pending = None
+        logger.info(f"[{self.role}] Rollout {rollout_id}: train_critic_with_returns completed")
 
     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
+        logger.info(f"[actor] Rollout {rollout_id}: train_actor called")
+        
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
 
@@ -576,80 +737,169 @@ class MegatronTrainRayActor(TrainRayActor):
                     if self.args.use_rollout_routing_replay:
                         RoutingReplay.clear_all_forward()
 
-                if self.args.use_critic:
-                    sync_actor_critic_data(
-                        self.args,
-                        rollout_data,
-                        self._actor_critic_groups,
-                    )
-                if self._active_model_tag != "actor":
-                    self._switch_model("actor")
+            # Stage 1: 从 Critics 接收 values（不发送 returns 和 log_probs）
+            logger.info(f"[actor] Rollout {rollout_id}: Stage 1 - Receiving values from critics")
+            
+            if self.args.use_critic:
+                logger.info(f"[actor] Rollout {rollout_id}: Receiving values from critic1")
+                sync_actor_critic_data(
+                    self.args,
+                    rollout_data,
+                    self._actor_critic_groups,
+                    sync_returns=False,
+                    sync_log_probs=False,  # ← 重要：与 Critic 的调用保持一致
+                )
+                logger.info(f"[actor] Rollout {rollout_id}: Received values from critic1")
+            
+            # 添加：从第二个 critic 接收 2_values
+            if self.args.use_critic2:
+                logger.info(f"[actor] Rollout {rollout_id}: Receiving 2_values from critic2")
+                sync_actor_critic_data(
+                    self.args,
+                    rollout_data,
+                    self._actor_critic2_groups,
+                    value_key="2_values",
+                    sync_returns=False,
+                    sync_log_probs=False,  # ← 重要：与 Critic 的调用保持一致
+                )
+                logger.info(f"[actor] Rollout {rollout_id}: Received 2_values from critic2")
+            
+            # 添加：合并两个 critics 的 values（如果都存在）
+            if self.args.use_critic and self.args.use_critic2:
+                logger.info(f"[actor] Rollout {rollout_id}: Merging values from critic1 and critic2")
+                
+                values1 = rollout_data.get("values")
+                values2 = rollout_data.get("2_values")
+                
+                # 更严格的检查：确保两个 values 都存在且非空
+                if values1 is not None and values2 is not None and len(values1) > 0 and len(values2) > 0:
+                    # 检查长度是否一致
+                    if len(values1) != len(values2):
+                        raise ValueError(f"Values length mismatch: values1={len(values1)}, values2={len(values2)}")
+                    
+                    # 使用平均值合并
+                    merged_values = []
+                    for v1, v2 in zip(values1, values2, strict=True):
+                        # 检查形状是否一致
+                        if v1.shape != v2.shape:
+                            raise ValueError(f"Values shape mismatch: v1.shape={v1.shape}, v2.shape={v2.shape}")
+                        merged_values.append((v1 + v2) / 2)
+                    
+                    rollout_data["values"] = merged_values
+                    logger.info(f"[actor] Rollout {rollout_id}: Merged values from critic1 and critic2: {len(merged_values)}")
+                    # 可选：保留原始 values 用于分析
+                    rollout_data["values_critic1"] = values1
+                    rollout_data["values_critic2"] = values2
+                elif values1 is not None and len(values1) > 0:
+                    # 只有 critic1 有值，直接使用
+                    rollout_data["values"] = values1
+                    logger.info(f"Only critic1 has values, using values1: {len(values1)}")
+                elif values2 is not None and len(values2) > 0:
+                    # 只有 critic2 有值，需要重命名或处理
+                    rollout_data["values"] = values2
+                    logger.info(f"Only critic2 has values, using values2: {len(values2)}")
+            
+            # 切换到 actor 模型（无论使用几个 critics）
+            if self._active_model_tag != "actor":
+                logger.info(f"[actor] Rollout {rollout_id}: Switching to actor model")
+                self._switch_model("actor")
+                logger.info(f"[actor] Rollout {rollout_id}: Switched to actor model")
 
-                # Calculate adv and returns. Need to performed before training (instead of on the fly),
-                # because we may need normalize the whole rollout.
-                compute_advantages_and_returns(self.args, rollout_data)
+            # Calculate adv and returns. Need to performed before training (instead of on the fly),
+            # because we may need normalize the whole rollout.
+            logger.info(f"[actor] Rollout {rollout_id}: Computing advantages and returns")
+            compute_advantages_and_returns(self.args, rollout_data)
+            logger.info(f"[actor] Rollout {rollout_id}: Advantages and returns computed")
+            # 在第774行 logger.info(f"[actor] Rollout {rollout_id}: Advantages and returns computed") 之后
 
-                # ============ 新增：统计position-advantage关系 ============
-                if getattr(self.args, 'log_position_value_stats', False) and "advantages" in rollout_data:
-                    # 只在最后一个pipeline stage记录（与value统计保持一致）
-                    if (
-                        mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-                        and mpu.get_tensor_model_parallel_rank() == 0
-                        and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
-                    ):
-                        import numpy as np
-                        from slime.utils import tracking_utils
-                        from torch.nn.utils.rnn import pad_sequence
+           
+            # Stage 2: 将 returns 广播回 Critics
+            logger.info(f"[actor] Rollout {rollout_id}: Stage 2 - Broadcasting returns to critics")
+            
+            if self.args.use_critic:
+                logger.info(f"[actor] Rollout {rollout_id}: Broadcasting returns to critic1")
+                sync_actor_critic_data(
+                    self.args,
+                    rollout_data,
+                    self._actor_critic_groups,
+                    sync_returns=True,
+                    sync_values=False,  # Don't overwrite actor's merged values
+                )
+                logger.info(f"[actor] Rollout {rollout_id}: Returns broadcast to critic1 completed")
+            
+            if self.args.use_critic2:
+                logger.info(f"[actor] Rollout {rollout_id}: Broadcasting returns to critic2")
+                sync_actor_critic_data(
+                    self.args,
+                    rollout_data,
+                    self._actor_critic2_groups,
+                    value_key="2_values",
+                    sync_returns=True,
+                    sync_values=False,  # Don't overwrite actor's merged values
+                )
+                logger.info(f"[actor] Rollout {rollout_id}: Returns broadcast to critic2 completed")
+            
+            # ============ 新增：统计position-advantage关系 ============
+            if getattr(self.args, 'log_position_value_stats', False) and "advantages" in rollout_data:
+                # 只在最后一个pipeline stage记录（与value统计保持一致）
+                if (
+                    mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+                    and mpu.get_tensor_model_parallel_rank() == 0
+                    and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
+                ):
+                    import numpy as np
+                    from slime.utils import tracking_utils
+                    from torch.nn.utils.rnn import pad_sequence
 
-                        # 计算训练步数（与value统计保持一致）
-                        num_steps_per_rollout = len(num_microbatches)
-                        accumulated_step_id = rollout_id * num_steps_per_rollout
+                    # 计算训练步数（与value统计保持一致）
+                    num_steps_per_rollout = len(num_microbatches)
+                    accumulated_step_id = rollout_id * num_steps_per_rollout
 
-                        # 使用 tensor 操作批量计算每个位置的均值
-                        # 1. Pad 到最大长度以便批量计算
-                        padded_advantages = pad_sequence(rollout_data["advantages"], batch_first=True, padding_value=float('nan'))  # [B, MaxLen]
+                    # 使用 tensor 操作批量计算每个位置的均值
+                    # 1. Pad 到最大长度以便批量计算
+                    padded_advantages = pad_sequence(rollout_data["advantages"], batch_first=True, padding_value=float('nan'))  # [B, MaxLen]
 
-                        # 2. 计算最大位置（用于元信息记录）
-                        max_position = padded_advantages.shape[1] - 1 if padded_advantages.shape[1] > 0 else 0
+                    # 2. 计算最大位置（用于元信息记录）
+                    max_position = padded_advantages.shape[1] - 1 if padded_advantages.shape[1] > 0 else 0
 
-                        # 3. 只处理前 max_log_positions 个位置
-                        max_log_positions = getattr(self.args, 'max_log_positions', 50)
-                        target_len = min(padded_advantages.shape[1], max_log_positions)
-                        sliced_advantages = padded_advantages[:, :target_len]  # [B, target_len]
+                    # 3. 只处理前 max_log_positions 个位置
+                    max_log_positions = getattr(self.args, 'max_log_positions', 50)
+                    target_len = min(padded_advantages.shape[1], max_log_positions)
+                    sliced_advantages = padded_advantages[:, :target_len]  # [B, target_len]
 
-                        # 4. 批量计算每个位置的均值、标准差等统计信息（忽略 padding 的 nan）
-                        means = torch.from_numpy(np.nanmean(sliced_advantages.cpu().numpy(), axis=0))  # [target_len]
-                        stds = torch.from_numpy(np.nanstd(sliced_advantages.cpu().numpy(), axis=0))    # [target_len]
+                    # 4. 批量计算每个位置的均值、标准差等统计信息（忽略 padding 的 nan）
+                    means = torch.from_numpy(np.nanmean(sliced_advantages.cpu().numpy(), axis=0))  # [target_len]
+                    stds = torch.from_numpy(np.nanstd(sliced_advantages.cpu().numpy(), axis=0))    # [target_len]
 
-                        # 5. 构建 log_dict
-                        log_dict = {}
-                        valid_positions = []
-                        for pos in range(target_len):
-                            mean_adv = float(means[pos].item())
-                            std_adv = float(stds[pos].item())
-                            if not np.isnan(means[pos].item()):
-                                log_dict[f"actor/advantage_pos_{pos}_mean"] = mean_adv
-                                log_dict[f"actor/advantage_pos_{pos}_std"] = std_adv
-                                valid_positions.append(pos)
+                    # 5. 构建 log_dict
+                    log_dict = {}
+                    valid_positions = []
+                    for pos in range(target_len):
+                        mean_adv = float(means[pos].item())
+                        std_adv = float(stds[pos].item())
+                        if not np.isnan(means[pos].item()):
+                            log_dict[f"actor/advantage_pos_{pos}_mean"] = mean_adv
+                            log_dict[f"actor/advantage_pos_{pos}_std"] = std_adv
+                            valid_positions.append(pos)
 
-                        # 额外记录一些元信息
-                        log_dict["actor/advantage_max_position"] = max_position
-                        log_dict["actor/advantage_num_samples"] = len(rollout_data["advantages"])
-                        log_dict["train/step"] = accumulated_step_id
+                    # 额外记录一些元信息
+                    log_dict["actor/advantage_max_position"] = max_position
+                    log_dict["actor/advantage_num_samples"] = len(rollout_data["advantages"])
+                    log_dict["train/step"] = accumulated_step_id
 
-                        # 使用tracking_utils记录
-                        tracking_utils.log(self.args, log_dict, step_key="train/step")
+                    # 使用tracking_utils记录
+                    tracking_utils.log(self.args, log_dict, step_key="train/step")
 
-                        # 格式化输出position-advantage统计信息
-                        position_stats_str = ", ".join([
-                            f"pos_{pos}=μ{log_dict[f'actor/advantage_pos_{pos}_mean']:.4f}±σ{log_dict[f'actor/advantage_pos_{pos}_std']:.4f}"
-                            for pos in valid_positions
-                        ])
-                        logger.info(f"Position-Advantage Stats at step {accumulated_step_id}: "
-                                    f"max_pos={max_position}, num_samples={len(rollout_data['advantages'])}")
-                        logger.info(f"Position-wise mean±std advantages: {position_stats_str}")
-                # ============ 结束：统计position-advantage关系 ============
-
+                    # 格式化输出position-advantage统计信息
+                    position_stats_str = ", ".join([
+                        f"pos_{pos}=μ{log_dict[f'actor/advantage_pos_{pos}_mean']:.4f}±σ{log_dict[f'actor/advantage_pos_{pos}_std']:.4f}"
+                        for pos in valid_positions
+                    ])
+                    logger.info(f"Position-Advantage Stats at step {accumulated_step_id}: "
+                                f"max_pos={max_position}, num_samples={len(rollout_data['advantages'])}")
+                    logger.info(f"Position-wise mean±std advantages: {position_stats_str}")
+            # ============ 结束：统计position-advantage关系 ============
+            
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args)
 
@@ -658,6 +908,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
+            self.args.loss_type = "policy_loss"  # ← 修正：应该是 policy_loss 而不是 actor_loss
             with timer("actor_train"):
                 train(
                     rollout_id,
@@ -670,7 +921,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
             self.prof.step(rollout_id=rollout_id)
 
-        train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
+        train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data, role=self.role)
 
         if self.args.use_routing_replay:
             RoutingReplay.clear_all()
@@ -774,6 +1025,30 @@ class MegatronTrainRayActor(TrainRayActor):
         group_name = "actor_critic"
         world_size = 2
         self._actor_critic_groups = init_process_group(
+            backend="nccl",
+            init_method=f"tcp://{master_address}:{master_port}",
+            world_size=world_size,
+            rank=0 if self.role == "actor" else 1,
+            group_name=group_name,
+        )
+    # 添加：连接第二个 critic 的方法
+    def connect_actor_critic2(
+        self,
+        actor_handle: ActorHandle | None = None,
+        master_address: str | None = None,
+        master_port: int | None = None,
+    ) -> None:
+        """连接第二个 critic，创建独立的通信组"""
+        if self.role == "actor":
+            master_address = ray.util.get_node_ip_address()
+            with socket.socket() as sock:
+                sock.bind(("", 0))
+                master_port = sock.getsockname()[1]
+            actor_handle.connect_actor_critic2.remote(master_address=master_address, master_port=master_port)
+
+        group_name = "actor_critic2"  # 使用不同的组名
+        world_size = 2
+        self._actor_critic2_groups = init_process_group(
             backend="nccl",
             init_method=f"tcp://{master_address}:{master_port}",
             world_size=world_size,

@@ -1,0 +1,2 @@
+`SingleCritic_1.7B`:/mnt/shared-storage-user/p1-shared/liyizhuo/code/slime/logs/AsyPPO/1_7BCritic+WARMUP+32*4.log
+`DoubleCritic_1_7B+WARMUP+32*4-Origin`:/mnt/shared-storage-user/p1-shared/liyizhuo/code/slime/logs/AsyPPO/DoubleCritic_1_7B+WARMUP+32*4.log

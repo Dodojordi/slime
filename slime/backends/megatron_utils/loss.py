@@ -1,11 +1,10 @@
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from typing import Any
-
+import torch.nn.functional as F
 import torch
 from megatron.core import mpu
 from torch.utils.checkpoint import checkpoint
-
 from slime.utils.distributed_utils import distributed_masked_whiten
 from slime.utils.misc import load_function
 from slime.utils.ppo_utils import (
@@ -24,6 +23,8 @@ from slime.utils.types import RolloutBatch
 
 from .cp_utils import all_gather_with_cp, get_logits_and_tokens_offset_with_cp, get_sum_of_sample_mean
 
+import logging
+logger = logging.getLogger(__name__)
 
 def get_responses(
     logits: torch.Tensor,
@@ -100,6 +101,7 @@ def get_log_probs_and_entropy(
     total_lengths: list[int],
     response_lengths: list[int],
     with_entropy: bool = False,
+    requires_entropy_grad: bool = True,  # 新增此参数
     non_loss_data: bool = True,
 ) -> dict[str, list[torch.Tensor]]:
     """Compute per-token log-probabilities (and optionally entropy) on responses.
@@ -135,7 +137,12 @@ def get_log_probs_and_entropy(
         response_lengths=response_lengths,
     ):
         log_prob, entropy = calculate_log_probs_and_entropy(
-            logits_chunk, tokens_chunk, mpu.get_tensor_model_parallel_group(), with_entropy=with_entropy
+            logits_chunk,
+            tokens_chunk,
+            mpu.get_tensor_model_parallel_group(),
+            with_entropy=with_entropy,
+            chunk_size=getattr(args, "log_probs_chunk_size", -1),
+            requires_entropy_grad=requires_entropy_grad,  # 传递此参数
         )
 
         log_probs_list.append(log_prob.squeeze(-1))
@@ -178,6 +185,21 @@ def get_values(
         Dict with key "values" mapping to a list of `[R]` value tensors
         per sample.
     """
+    # value_list = []
+    # for logits_chunk, _ in get_responses(
+    #     logits,
+    #     args=args,
+    #     unconcat_tokens=unconcat_tokens,
+    #     total_lengths=total_lengths,
+    #     response_lengths=response_lengths,
+    # ):
+    #     assert logits_chunk.size(-1) == 1, f"{logits_chunk.shape}"
+    #     value_list.append(logits_chunk.squeeze(-1))
+
+    # return {
+    #     "values": value_list,
+    # }
+
     value_list = []
     for logits_chunk, _ in get_responses(
         logits,
@@ -187,8 +209,14 @@ def get_values(
         response_lengths=response_lengths,
     ):
         assert logits_chunk.size(-1) == 1, f"{logits_chunk.shape}"
-        value_list.append(logits_chunk.squeeze(-1))
-
+        value = logits_chunk.squeeze(-1)
+        
+        # ========== 新增这3行 ==========
+        if getattr(args, 'use_bce_value_loss', False):
+            value = torch.sigmoid(value)
+        # ==============================
+        
+        value_list.append(value)
     return {
         "values": value_list,
     }
@@ -463,6 +491,8 @@ def policy_loss_function(
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
 
+    entropy_requires_grad = args.entropy_coef > 0
+    
     log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
         args=args,
@@ -470,6 +500,7 @@ def policy_loss_function(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         with_entropy=True,
+        requires_entropy_grad=entropy_requires_grad,  # 传递标志
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
@@ -523,6 +554,38 @@ def policy_loss_function(
     if args.use_opsm:
         pg_loss = pg_loss * opsm_mask
 
+    # ============ 新增：基于两个critic值差异的advantage masking ============
+    if getattr(args, 'use_advantage_diff_mask', False):
+        # 检查是否有两个critic的values
+        if "values_critic1" in batch and "values_critic2" in batch:
+            from slime.utils.ppo_utils import compute_advantage_diff_mask
+            
+            # 【修改】：使用 detach 避免梯度追踪，减少显存
+            values1_detached = [v.detach() for v in batch["values_critic1"]]
+            values2_detached = [v.detach() for v in batch["values_critic2"]]
+            
+            # 计算advantage diff mask
+            top_k_percent = getattr(args, 'advantage_diff_mask_k', 0.1)
+            advantage_diff_mask_list = compute_advantage_diff_mask(
+                values1=values1_detached,
+                values2=values2_detached,
+                top_k_percent=top_k_percent,
+                response_lengths=batch["response_lengths"],
+        )
+            
+            # 将list转换为concatenated tensor
+            advantage_diff_mask = torch.cat(advantage_diff_mask_list, dim=0)
+            
+            # 应用mask到pg_loss（与loss_mask做AND运算）
+            pg_loss = pg_loss * advantage_diff_mask
+            
+            # 记录被mask掉的比例
+            mask_ratio = 1.0 - advantage_diff_mask.float().mean()
+            logger.info(f"Applied advantage_diff_mask: masked {mask_ratio*100:.2f}% of tokens")
+        else:
+            logger.warning("use_advantage_diff_mask=True but values_critic1/values_critic2 not found in batch")
+    # ============ 结束：advantage masking ============
+    
     # Apply off-policy correction using importance sampling if enabled
     if args.get_mismatch_metrics or args.use_tis:
         assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS"
@@ -558,7 +621,33 @@ def policy_loss_function(
     entropy = log_probs_and_entropy["entropy"]
     entropy = torch.cat(entropy, dim=0)
     entropy_loss = sum_of_sample_mean(entropy)
-
+    # ============ 新增：基于value分歧的熵正则化过滤 ============
+    if getattr(args, 'use_entropy_value_divergence_filter', False):
+        # 检查是否有两个critic的values
+        if "values_critic1" in batch and "values_critic2" in batch:
+            from slime.utils.ppo_utils import compute_entropy_mask_by_value_divergence
+            
+            # 计算entropy mask（过滤掉高分歧的tokens）
+            top_h_percent = getattr(args, 'entropy_divergence_filter_h', 0.1)  # 默认过滤掉10%
+            entropy_mask_list = compute_entropy_mask_by_value_divergence(
+                values1=batch["values_critic1"],
+                values2=batch["values_critic2"],
+                top_h_percent=top_h_percent,
+                response_lengths=batch["response_lengths"],
+            )
+            
+            # 将list转换为concatenated tensor
+            entropy_mask = torch.cat(entropy_mask_list, dim=0)
+            
+            # 应用mask到entropy（只保留低分歧token的熵）
+            entropy = entropy * entropy_mask
+            
+            # 记录被过滤掉的比例
+            mask_ratio = 1.0 - entropy_mask.float().mean()
+            logger.info(f"Applied entropy_value_divergence_filter: filtered {mask_ratio*100:.2f}% of tokens")
+        else:
+            logger.warning("use_entropy_value_divergence_filter=True but values_critic1/values_critic2 not found in batch")
+    # ============ 结束：熵正则化过滤 ============
     loss = pg_loss - args.entropy_coef * entropy_loss
     # Positive Example LM Loss (NLL loss for correct samples)
     if getattr(args, 'use_positive_nll_loss', False) and 'positive_nll_mask' in batch:
@@ -668,11 +757,76 @@ def value_loss_function(
 
     returns = torch.cat(batch["returns"], dim=0)
 
-    values_clipfrac = torch.abs(values - old_values) > args.value_clip
-    values_clipped = old_values + (values - old_values).clamp(-args.value_clip, args.value_clip)
-    surr1 = (values_clipped - returns) ** 2
-    surr2 = (values - returns) ** 2
-    loss = torch.max(surr1, surr2)
+    # values_clipfrac = torch.abs(values - old_values) > args.value_clip
+    # values_clipped = old_values + (values - old_values).clamp(-args.value_clip, args.value_clip)
+    # surr1 = (values_clipped - returns) ** 2
+    # surr2 = (values - returns) ** 2
+    # loss = torch.max(surr1, surr2)
+    # ==================== BCE Loss for binary returns ====================
+    use_bce = getattr(args, 'use_bce_value_loss', False)
+    
+    if use_bce:
+        # Returns should already be in {0, 1} format
+        targets = returns.clamp(0.0, 1.0)
+        
+        # ========== 新增：将概率转回logits用于训练 ==========
+        # old_values 和 values 现在都是概率值 [0,1]
+        # 需要转回logits进行BCE loss计算
+        eps = 1e-7
+        old_logits = torch.logit(old_values.clamp(eps, 1-eps))
+        values_logits = torch.logit(values.clamp(eps, 1-eps))
+        # ================================================
+        
+        # Optional: value clipping in logit space
+        if args.value_clip > 0:
+            logits_clipped = old_logits + (values_logits - old_logits).clamp(-args.value_clip, args.value_clip)
+            
+            # BCE with logits (numerically stable)
+            loss_clipped = F.binary_cross_entropy_with_logits(logits_clipped, targets, reduction='none')
+            loss_unclipped = F.binary_cross_entropy_with_logits(values_logits, targets, reduction='none')
+            loss = torch.max(loss_clipped, loss_unclipped)
+            
+            values_clipfrac = (torch.abs(values_logits - old_logits) > args.value_clip).float()
+        else:
+            loss = F.binary_cross_entropy_with_logits(values_logits, targets, reduction='none')
+            values_clipfrac = torch.zeros_like(loss)
+        
+        # For metrics: values already in [0, 1] (probabilities)
+        # ========== 修改：直接使用values，无需再sigmoid ==========
+        values_for_ev = values  # 已经是概率
+        # ====================================================
+    
+    else:
+        # ==================== Original MSE Loss ====================
+        values_clipfrac = torch.abs(values - old_values) > args.value_clip
+        values_clipped = old_values + (values - old_values).clamp(-args.value_clip, args.value_clip)
+        surr1 = (values_clipped - returns) ** 2
+        surr2 = (values - returns) ** 2
+        loss = torch.max(surr1, surr2)
+        values_for_ev = values
+    # ==================== End loss computation ====================
+    # ==================== 新增：应用异步Critic训练的样本mask ====================
+    if getattr(args, 'use_asytrain_critic', False) and "asy_critic_train_mask" in batch:
+        # 将per-sample的mask扩展到per-token
+        response_lengths = batch["response_lengths"]
+        asy_train_mask_per_token = []
+        
+        for sample_mask, resp_len in zip(batch["asy_critic_train_mask"], response_lengths):
+            asy_train_mask_per_token.extend([sample_mask] * resp_len)
+        
+        asy_train_mask_tensor = torch.tensor(
+            asy_train_mask_per_token, 
+            dtype=torch.float32, 
+            device=loss.device
+        )
+        
+        # 逐元素相乘：只有mask=1的样本才计算loss
+        loss = loss * asy_train_mask_tensor
+        
+        num_active_tokens = asy_train_mask_tensor.sum().item()
+        num_total_tokens = asy_train_mask_tensor.numel()
+        logger.info(f"Applied asy_critic_train_mask: {num_active_tokens}/{num_total_tokens} tokens active")
+    # ==================== 结束：应用异步Critic训练的样本mask ====================
 
     loss = sum_of_sample_mean(loss)
     values_clipfrac = sum_of_sample_mean(values_clipfrac.float())
@@ -681,37 +835,81 @@ def value_loss_function(
     if values.numel() == 0:
         loss += 0 * values.sum()
 
-    # Compute Explained Variance: EV = 1 - Var(y_true - y_pred) / Var(y_true)
-    # where y_true = returns, y_pred = values
-    with torch.no_grad():
-        # Get loss masks to compute variance only on valid tokens
-        loss_masks = torch.cat(batch["loss_masks"], dim=0)
+    # Compute Explained Variance
+    # with torch.no_grad():
+    #     loss_masks_cat = torch.cat(batch["loss_masks"], dim=0)
+    #     # valid_mask = loss_masks.bool()
+    #     n_ret = returns.shape[0]
+    #     if loss_masks_cat.shape[0] != n_ret:
+    #         # 与 returns 长度不一致，不能直接索引；只在不越界的前提下用「全有效」或跳过
+    #         valid_mask = torch.ones(n_ret, dtype=torch.bool, device=returns.device)
+    #         # 若希望更保守，可直接：explained_variance = 0，且不执行后面的 valid_returns/valid_values 计算
+    #     else:
+    #         valid_mask = loss_masks_cat.bool()
         
-        # Filter valid tokens using masks
-        valid_mask = loss_masks.bool()
+    #     if valid_mask.sum() > 0:
+    #         valid_returns = returns[valid_mask]
+    #         valid_values = values_for_ev[valid_mask]
+    #         residuals = valid_returns - valid_values
+    #         var_residuals = residuals.var(unbiased=False)
+    #         var_returns = valid_returns.var(unbiased=False)
+            
+    #         eps = 1e-8
+    #         if var_returns > eps:
+    #             explained_variance = 1.0 - var_residuals / (var_returns + eps)
+    #         else:
+    #             explained_variance = torch.tensor(0.0, device=values.device, dtype=values.dtype)
+    #     else:
+    #         explained_variance = torch.tensor(0.0, device=values.device, dtype=values.dtype)
+        # Compute Explained Variance（CP-aware：mask 与 returns 同结构）
+    with torch.no_grad():
+        loss_masks_list = batch["loss_masks"]
+        total_lengths = batch["total_lengths"]
+        response_lengths = batch["response_lengths"]
+        cp_size = mpu.get_context_parallel_world_size()
+
+        if cp_size == 1:
+            valid_mask = torch.cat(loss_masks_list, dim=0).bool()
+        else:
+            mask_chunks = []
+            for i in range(len(loss_masks_list)):
+                total_len = total_lengths[i]
+                response_len = response_lengths[i]
+                prompt_len = total_len - response_len
+                _, _, _, token_offsets = get_logits_and_tokens_offset_with_cp(total_len, response_len)
+                s0, e0 = token_offsets[0]
+                s1, e1 = token_offsets[1]
+                res_s0 = max(0, s0 - prompt_len)
+                res_e0 = max(0, e0 - prompt_len)
+                res_s1 = max(0, s1 - prompt_len)
+                res_e1 = max(0, e1 - prompt_len)
+                full_mask = loss_masks_list[i]
+                local_parts = []
+                if res_e0 > res_s0:
+                    local_parts.append(full_mask[res_s0:res_e0])
+                if res_e1 > res_s1:
+                    local_parts.append(full_mask[res_s1:res_e1])
+                local_chunk = (
+                    torch.cat(local_parts)
+                    if local_parts
+                    else torch.tensor([], device=full_mask.device, dtype=full_mask.dtype)
+                )
+                mask_chunks.append(local_chunk)
+            valid_mask = torch.cat(mask_chunks, dim=0).bool()
+
         if valid_mask.sum() > 0:
             valid_returns = returns[valid_mask]
-            valid_values = values[valid_mask]
-            
-            # Compute residuals
+            valid_values = values_for_ev[valid_mask]
             residuals = valid_returns - valid_values
-            
-            # Compute variances
             var_residuals = residuals.var(unbiased=False)
             var_returns = valid_returns.var(unbiased=False)
-            
-            # Compute Explained Variance
-            # Add small epsilon to avoid division by zero
             eps = 1e-8
             if var_returns > eps:
                 explained_variance = 1.0 - var_residuals / (var_returns + eps)
             else:
-                # If variance is too small, set EV to 0
                 explained_variance = torch.tensor(0.0, device=values.device, dtype=values.dtype)
         else:
-            # No valid tokens, set EV to 0
             explained_variance = torch.tensor(0.0, device=values.device, dtype=values.dtype)
-
     reported_loss = {
         "value_loss": loss.clone().detach(),
         "value_clipfrac": values_clipfrac.clone().detach(),

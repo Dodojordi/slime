@@ -563,7 +563,7 @@ class FSDPTrainRayActor(TrainRayActor):
 
         self.prof.step(rollout_id=rollout_id)
 
-        train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
+        train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data, role=self.role)
 
         # Update ref model if needed (copy actor weights to ref)
         if (

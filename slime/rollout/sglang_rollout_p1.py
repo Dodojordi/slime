@@ -26,7 +26,7 @@ from slime.utils.processing_utils import (
     prepare_model_inputs,
 )
 from slime.utils.types import Sample
-
+import random
 from .rm_hub import async_rm, batched_async_rm
 
 __all__ = ["generate_rollout"]
@@ -71,20 +71,42 @@ class GenerateState(metaclass=SingletonMeta):
         self.pendings = set()
         self.aborted = False
 
-    def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
-        for group in samples:
-            self.pendings.add(
-                asyncio.create_task(
-                    # submit a group of samples as a single task.
-                    generate_and_rm_group(
-                        self.args,
-                        group,
-                        sampling_params=self.sampling_params.copy(),
-                        evaluation=False,
+    def submit_generate_tasks(self, samples: list[list[Sample]], shuffle_for_load_balance: bool = False) -> None:
+        if shuffle_for_load_balance:
+            # Flatten groups into individual samples and shuffle for load balancing
+            flattened_samples = []
+            for group in samples:
+                flattened_samples.extend(group)
+            random.shuffle(flattened_samples)
+            
+            # Submit each sample individually
+            for sample in flattened_samples:
+                self.pendings.add(
+                    asyncio.create_task(
+                        generate_and_rm(
+                            self.args,
+                            sample,
+                            sampling_params=self.sampling_params.copy(),
+                            evaluation=False,
+                        )
                     )
                 )
-            )
-        self.remaining_batch_size += len(samples)
+            self.remaining_batch_size += len(flattened_samples)
+        else:
+            # Original behavior: submit groups
+            for group in samples:
+                self.pendings.add(
+                    asyncio.create_task(
+                        # submit a group of samples as a single task.
+                        generate_and_rm_group(
+                            self.args,
+                            group,
+                            sampling_params=self.sampling_params.copy(),
+                            evaluation=False,
+                        )
+                    )
+                )
+            self.remaining_batch_size += len(samples)
 
 
 async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
@@ -123,7 +145,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         "sampling_params": sampling_params,
         "return_logprob": True,
     }
-    # logger.info(f"Actual sampling_params sent to sglang: {sampling_params}")
+
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
 
@@ -144,7 +166,6 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
 
     output = await post(url, payload)
 
-    # Extract new response tokens
 
     if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
         assert not args.partial_rollout, "Currently parital rollout is not suppurted when using slime router"
@@ -159,7 +180,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         sample.rollout_log_probs = retrieve_output["rollout_logp"][-sample.response_length :]
         # Notice: currently cannot get the spec info from radix router output.
     else:
-        if "output_token_logprobs" in output["meta_info"]:
+        if "output_token_logprobs" in output["meta_info"] and len(output["meta_info"]["output_token_logprobs"]) > 0 and len(output["meta_info"]["output_token_logprobs"][0]) > 0:
             new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
             new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
         else:
@@ -293,9 +314,16 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
         response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
         urls = [worker["url"] for worker in response["workers"]]
 
-    logger.info(f"Abort request for {urls}")
-    await asyncio.gather(*[post(f"{url}/abort_request", {"abort_all": True}) for url in urls])
+    for url in urls:
+        logger.info(f"Abort request for {url}")
+        await post(f"{url}/abort_request", {"abort_all": True})
 
+    # Check if shuffle mode is enabled
+    shuffle_mode = getattr(args, 'shuffle_prompts_for_load_balance', False)
+    
+    # For shuffle mode, collect individual samples by group_index
+    collected_samples_by_group = {} if shuffle_mode else None
+    
     # make sure all the pending tasks are finished
     count = 0
     while state.pendings:
@@ -306,15 +334,41 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
 
         # for partial rollout, collect the partial samples into the data buffer
         for task in done:
-            group = task.result()
-            for sample in group:
+            result = task.result()
+            
+            # Handle both single samples (shuffle mode) and groups (normal mode)
+            if isinstance(result, Sample):
+                # Single sample from shuffle mode
+                sample = result
                 if sample.response and "start_rollout_id" not in sample.metadata:
                     sample.metadata["start_rollout_id"] = rollout_id
-            aborted_samples.append(group)
-            count += len(group)
+                
+                # Collect by group_index
+                if sample.group_index not in collected_samples_by_group:
+                    collected_samples_by_group[sample.group_index] = []
+                collected_samples_by_group[sample.group_index].append(sample)
+                
+                # Check if group is complete
+                if len(collected_samples_by_group[sample.group_index]) == args.n_samples_per_prompt:
+                    group = collected_samples_by_group[sample.group_index]
+                    aborted_samples.append(group)
+                    count += len(group)
+                    del collected_samples_by_group[sample.group_index]
+            else:
+                # Group of samples from normal mode
+                group = result
+                for sample in group:
+                    if sample.response and "start_rollout_id" not in sample.metadata:
+                        sample.metadata["start_rollout_id"] = rollout_id
+                aborted_samples.append(group)
+                count += len(group)
 
     if args.partial_rollout:
         logger.info(f"Collected {count} partial samples into the data buffer")
+        if shuffle_mode and collected_samples_by_group:
+            incomplete_groups = len(collected_samples_by_group)
+            incomplete_samples = sum(len(g) for g in collected_samples_by_group.values())
+            logger.info(f"Discarded {incomplete_groups} incomplete groups ({incomplete_samples} samples) during abort")
 
     return aborted_samples
 
@@ -348,43 +402,81 @@ async def generate_rollout_async(
     # target_data_size is the total number of valid samples to get
     target_data_size = args.rollout_batch_size
 
+    # Check if we should shuffle for load balancing
+    shuffle_for_load_balance = getattr(args, 'shuffle_prompts_for_load_balance', False)
+    
     data = []
+    # If shuffling, we need to collect individual samples and regroup them later
+    collected_samples = {} if shuffle_for_load_balance else None
+    
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
     while len(data) < target_data_size:
-        while state.remaining_batch_size < target_data_size:
+        while state.remaining_batch_size < target_data_size * (args.n_samples_per_prompt if shuffle_for_load_balance else 1):
             # get samples from the buffer and submit the generation requests.
             samples = data_source(args.over_sampling_batch_size)
-            state.submit_generate_tasks(samples)
+            state.submit_generate_tasks(samples, shuffle_for_load_balance=shuffle_for_load_balance)
 
         # wait for the generation to finish
         done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
-            group: list[Sample] = task.result()
+            result = task.result()
+            
+            if shuffle_for_load_balance:
+                # Result is a single Sample, collect and group later
+                sample: Sample = result
+                
+                if do_print:
+                    logger.info(
+                        f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {sample.label}, reward: {sample.reward}",
+                    )
+                    do_print = False
+                
+                # Collect samples by group_index
+                if sample.group_index not in collected_samples:
+                    collected_samples[sample.group_index] = []
+                collected_samples[sample.group_index].append(sample)
+                
+                # Check if we have completed a group
+                if len(collected_samples[sample.group_index]) == args.n_samples_per_prompt:
+                    group = collected_samples[sample.group_index]
+                    del collected_samples[sample.group_index]
+                    
+                    dynamic_filter_output = _call_dynamic_filter(dynamic_filter, args, group)
+                    if not dynamic_filter_output.keep:
+                        metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
+                        state.remaining_batch_size -= args.n_samples_per_prompt
+                        continue
+                    
+                    # add the samples to the data
+                    if len(data) < target_data_size:
+                        data.append(group)
+                        pbar.update(args.n_samples_per_prompt)
+                    state.remaining_batch_size -= args.n_samples_per_prompt
+            else:
+                # Original behavior: result is a group
+                group: list[Sample] = result
 
-            if do_print:
-                sample = group[0][0] if isinstance(group[0], list) else group[0]
-                logger.info(
-                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {sample.label}, reward: {sample.reward}",
-                )
-                do_print = False
+                if do_print:
+                    sample = group[0][0] if isinstance(group[0], list) else group[0]
+                    logger.info(
+                        f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {sample.label}, reward: {sample.reward}",
+                    )
+                    do_print = False
 
-            assert len(group) == args.n_samples_per_prompt
-            dynamic_filter_output = _call_dynamic_filter(dynamic_filter, args, group)
-            if not dynamic_filter_output.keep:
-                metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
+                assert len(group) == args.n_samples_per_prompt
+                dynamic_filter_output = _call_dynamic_filter(dynamic_filter, args, group)
+                if not dynamic_filter_output.keep:
+                    metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
+                    state.remaining_batch_size -= 1
+                    continue
+
+                # add the samples to the data
+                # NOTE: here we have not stored all the unused samples back to the data buffer.
+                if len(data) < target_data_size:
+                    data.append(group)
+                    pbar.update(args.n_samples_per_prompt)
                 state.remaining_batch_size -= 1
-                continue
-
-            # add the samples to the data
-            # NOTE: here we have not stored all the unused samples back to the data buffer.
-            if len(data) < target_data_size:
-                data.append(group)
-                # for _sample in group:
-                #     logger.info(
-                #         f"加入的数据: {[str(_sample.prompt) + _sample.response]}, label: {_sample.label}, reward: {_sample.reward}"
-                #     )
-                pbar.update(args.n_samples_per_prompt)
 
     pbar.close()
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
@@ -394,6 +486,7 @@ async def generate_rollout_async(
 
     # there are still some unfinished requests, abort them
     aborted_samples = await abort(args, rollout_id)
+    # time.sleep(10)
 
     assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
     data = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
@@ -438,18 +531,200 @@ class _MetricGatherer:
 
 EVAL_PROMPT_DATASET = {}
 
-
 async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict[str, list[Any]]], list[list[Sample]]]:
-    assert not args.group_rm, "Group RM is not supported for eval rollout"
-
+    # assert not args.group_rm, "Group RM is not supported for eval rollout"
     coros = []
-    for dataset_cfg in getattr(args, "eval_datasets", []) or []:
-        coros.append(eval_rollout_single_dataset(args, rollout_id, dataset_cfg))
-    results_list = await asyncio.gather(*coros)
     results = {}
-    for r in results_list:
-        results.update(r)
+    if args.eval_group:
+        results = await eval_rollout_group(args, rollout_id)
+    else:
+        for dataset_cfg in getattr(args, "eval_datasets", []) or []:
+            coros.append(eval_rollout_single_dataset(args, rollout_id, dataset_cfg))
+        results_list = await asyncio.gather(*coros)
+        for r in results_list:
+            results.update(r)
     return RolloutFnEvalOutput(data=results), []
+
+# async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict[str, list[Any]]], list[list[Sample]]]:
+#     assert not args.group_rm, "Group RM is not supported for eval rollout"
+
+#     coros = []
+#     for dataset_cfg in getattr(args, "eval_datasets", []) or []:
+#         coros.append(eval_rollout_single_dataset(args, rollout_id, dataset_cfg))
+#     results_list = await asyncio.gather(*coros)
+#     results = {}
+#     for r in results_list:
+#         results.update(r)
+#     return RolloutFnEvalOutput(data=results), []
+
+
+async def eval_rollout_group(args, rollout_id):
+    """An example to implement the eval_rollout function for an rule based rm rollout generation.
+
+    Args:
+        args: the whole args
+        rollout_id: int, the id of the rollout, used for deterministic data generation
+        name: str, the name of the dataset
+        path: str, the path of the dataset
+    """
+    import json
+    import os
+    from collections import defaultdict
+
+    global EVAL_PROMPT_DATASET
+
+    for i in range(0, len(args.eval_prompt_data), 2):
+        name, path = args.eval_prompt_data[i : i + 2]
+        if name not in EVAL_PROMPT_DATASET:
+            tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
+            processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
+            EVAL_PROMPT_DATASET[name] = Dataset(
+                path,
+                tokenizer=tokenizer,
+                processor=processor,
+                max_length=args.rollout_max_prompt_len,
+                prompt_key=args.input_key if args.eval_input_key is None else args.eval_input_key,
+                label_key=args.label_key if args.eval_label_key is None else args.eval_label_key,
+                metadata_key=args.metadata_key,
+                tool_key=args.tool_key if args.eval_tool_key is None else args.eval_tool_key,
+                apply_chat_template=args.apply_chat_template,
+                name=name,
+                apply_chat_template_kwargs=args.apply_chat_template_kwargs,
+            )
+        # dataset = EVAL_PROMPT_DATASET[name]
+
+    sampling_params = dict(
+        temperature=args.rollout_temperature if args.eval_temperature is None else args.eval_temperature,
+        top_p=args.rollout_top_p if args.eval_top_p is None else args.eval_top_p,
+        top_k=args.rollout_top_k if args.eval_top_k is None else args.eval_top_k,
+        max_new_tokens=(
+            args.rollout_max_response_len if args.eval_max_response_len is None else args.eval_max_response_len
+        ),
+        stop=args.rollout_stop,
+        stop_token_ids=args.rollout_stop_token_ids,
+        skip_special_tokens=args.rollout_skip_special_tokens,
+        no_stop_trim=True,
+        spaces_between_special_tokens=False,
+    )
+
+    # Prepare n_samples_per_eval_prompt as a list or dict
+    if isinstance(args.n_samples_per_eval_prompt, int):
+        # Single value: use it for all datasets
+        n_samples_dict = {name: args.n_samples_per_eval_prompt for name in EVAL_PROMPT_DATASET.keys()}
+    elif isinstance(args.n_samples_per_eval_prompt, list):
+        # List of values: map to datasets in order
+        dataset_names = list(EVAL_PROMPT_DATASET.keys())
+        if len(args.n_samples_per_eval_prompt) == 1:
+            # Single element list: use it for all datasets
+            n_samples_dict = {name: args.n_samples_per_eval_prompt[0] for name in dataset_names}
+        elif len(args.n_samples_per_eval_prompt) != len(dataset_names):
+            raise ValueError(
+                f"Length of n_samples_per_eval_prompt ({len(args.n_samples_per_eval_prompt)}) "
+                f"must match the number of eval datasets ({len(dataset_names)}). "
+                f"Datasets: {dataset_names}"
+            )
+        else:
+            n_samples_dict = dict(zip(dataset_names, args.n_samples_per_eval_prompt))
+    else:
+        raise TypeError(f"n_samples_per_eval_prompt must be int or list, got {type(args.n_samples_per_eval_prompt)}")
+
+    tasks = []
+    # do multiple samples for eval prompts
+    sample_index = 0
+    for name, dataset in EVAL_PROMPT_DATASET.items():
+        n_samples = n_samples_dict[name]
+        for i, prompt_sample in enumerate(dataset.samples):
+            for j in range(n_samples):
+                # use the same prompt for multiple samples
+                sample = copy.deepcopy(prompt_sample)
+                sample.name = dataset.name
+                sample.index = sample_index
+                sample_index += 1
+                tasks.append(
+                    generate_and_rm(
+                        args,
+                        sample,
+                        sampling_params=sampling_params,
+                        evaluation=True,
+                    )
+                )
+    random.shuffle(tasks)
+    datalist = defaultdict(list)
+    do_print = True
+    pbar = tqdm(total=len(tasks), desc="Rollout generation", disable=not do_print)
+    
+    for coro in asyncio.as_completed(tasks):
+        sample = await coro
+        if do_print:
+            logger.info(
+                "eval_rollout_single_dataset example data: "
+                f"{[str(sample.prompt) + sample.response]} "
+                f"reward={sample.reward}"
+            )
+            do_print = False
+        if isinstance(sample, list):
+            datalist[sample.name].extend(sample)
+        else:
+            datalist[sample.name].append(sample)
+        pbar.update(1)
+    pbar.close()
+
+    results = {}
+
+    for name, data in datalist.items():
+        data.sort(key=lambda sample: sample.index)
+        reward_key = args.reward_key or args.eval_reward_key
+        
+        # Fix Sample.Status serialization for JSON
+        def sample_to_dict(sample):
+            d = sample.to_dict()
+            keys = ["group_index", "index", "name", "prompt", "response", "response_length", "label", "reward", "status"]
+            # only preserve key in keys, pop others
+            d = {k: d[k] for k in keys if k in d}
+            # If reward is not JSON serializable, try to convert
+            return d
+        # Save the data to a local JSON file
+        output_dir = getattr(args, "log_file_path", ".")
+        output_dir = os.path.dirname(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
+        output_file = os.path.join(output_dir, f"eval_{name}_rollout_{rollout_id}.json")
+
+        print(f"Saving eval data to {output_file}, Num: {len(data)}", flush=True)
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump([sample_to_dict(s) for s in data], f, ensure_ascii=False, indent=2)
+            
+        # Get the correct n_samples for this dataset
+        n_samples_for_dataset = n_samples_dict[name]
+        if isinstance(data[0].reward, dict) and 'point' in data[0].reward:
+            print(f"Dataset: {name}, Point: {sum([sample.reward['point'] for sample in data]) / n_samples_for_dataset}, Avg score: {sum([sample.reward['score'] for sample in data]) / len(data)}", flush=True)
+            results[name] = {
+                    "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
+                    "scores": [sample.reward['score'] for sample in data],
+                    "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
+                    "points": [sample.reward['point'] for sample in data],
+                    "scores_noxverify": [sample.reward['score_noxverify'] for sample in data],
+                    "points_noxverify": [sample.reward['point_noxverify'] for sample in data],
+                    "n_samples_per_prompt": n_samples_for_dataset,
+                }
+        else:
+            print(f"Dataset: {name}, Avg score: {sum([float(sample.reward) if not reward_key else float(sample.reward[reward_key]) for sample in data]) / len(data)}", flush=True)
+            results[name] = {
+                    "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
+                    "scores": [sample.reward['score'] for sample in data],
+                    "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
+                    "n_samples_per_prompt": n_samples_for_dataset,
+                }
+    
+    return results
+
+
+
+# async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict[str, list[Any]]], list[list[Sample]]]:
+#     assert not args.group_rm, "Group RM is not supported for eval rollout"
+#     results = {}
+#     for dataset_cfg in getattr(args, "eval_datasets", []) or []:
+#         results.update(await eval_rollout_single_dataset(args, rollout_id, dataset_cfg))
+#     return RolloutFnEvalOutput(data=results), []
 
 
 async def eval_rollout_single_dataset(
@@ -481,6 +756,7 @@ async def eval_rollout_single_dataset(
             metadata_key=dataset_cfg.metadata_key,
             tool_key=dataset_cfg.tool_key,
             apply_chat_template=args.apply_chat_template,
+            name=name,
             apply_chat_template_kwargs=args.apply_chat_template_kwargs,
         )
     dataset = EVAL_PROMPT_DATASET[cache_key]
@@ -521,18 +797,17 @@ async def eval_rollout_single_dataset(
             )
 
     data = []
-    print_count = 10  # 多打印几个 sample
-    printed = 0
-    pbar = tqdm(total=len(tasks), desc="Rollout generation", disable=False)
+    do_print = True
+    pbar = tqdm(total=len(tasks), desc="Rollout generation", disable=not do_print)
     for coro in asyncio.as_completed(tasks):
         sample = await coro
-        if printed < print_count:
+        if do_print:
             logger.info(
                 "eval_rollout_single_dataset example data: "
                 f"{[str(sample.prompt) + sample.response]} "
                 f"reward={sample.reward}"
             )
-            printed += 1
+            do_print = False
         if isinstance(sample, list):
             data.extend(sample)
         else:
@@ -542,44 +817,48 @@ async def eval_rollout_single_dataset(
 
     data.sort(key=lambda sample: sample.index)
 
-    # reward_key = args.eval_reward_key or args.reward_key
-    # return {
-    #     dataset_cfg.name: {
-    #         "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
-    #         "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
-    #         "samples": data,
-    #     }
-    # }
-    reward_key = args.eval_reward_key or args.reward_key
-    n_samples_for_dataset = dataset_cfg.n_samples_per_eval_prompt
-    
-    result_dict = {
-        "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
-        "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
-        "samples": data,
-        "n_samples_per_prompt": n_samples_for_dataset,
-    }
-    
-    # 如果 reward 是字典，尝试提取额外字段
-    if data and isinstance(data[0].reward, dict):
-        # 提取 scores（如果有）
-        if 'score' in data[0].reward:
-            result_dict["scores"] = [sample.reward['score'] for sample in data]
+    reward_key = args.reward_key or args.eval_reward_key
+    import json
+    import os
+    # Fix Sample.Status serialization for JSON
+    def sample_to_dict(sample):
+        d = sample.to_dict()
+        keys = ["group_index", "index", "name", "prompt", "response", "response_length", "label", "reward", "status"]
+        # only preserve key in keys, pop others
+        d = {k: d[k] for k in keys if k in d}
+        # If reward is not JSON serializable, try to convert
+        return d
+    # Save the data to a local JSON file
+    output_dir = getattr(args, "log_file_path", ".")
+    output_dir = os.path.dirname(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+    output_file = os.path.join(output_dir, f"eval_{name}_rollout_{rollout_id}.json")
+
+    print(f"Saving eval data to {output_file}", flush=True)
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump([sample_to_dict(s) for s in data], f, ensure_ascii=False, indent=2)
         
-        # 提取 points（如果有）
-        if 'point' in data[0].reward:
-            result_dict["points"] = [sample.reward['point'] for sample in data]
-        
-        # 提取 scores_noxverify（如果有）
-        if 'score_noxverify' in data[0].reward:
-            result_dict["scores_noxverify"] = [sample.reward['score_noxverify'] for sample in data]
-        
-        # 提取 points_noxverify（如果有）
-        if 'point_noxverify' in data[0].reward:
-            result_dict["points_noxverify"] = [sample.reward['point_noxverify'] for sample in data]
-    
+    if 'point' in data[0].reward:
+        print(f"Dataset: {name}, Point: {sum([sample.reward['point'] for sample in data]) / n_samples_per_prompt}, Avg score: {sum([sample.reward['score'] for sample in data]) / len(data)}", flush=True)
+        return {
+            name: {
+                "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
+                "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
+                "points": [sample.reward['point'] for sample in data],
+                "scores_noxverify": [sample.reward['score_noxverify'] for sample in data],
+                "points_noxverify": [sample.reward['point_noxverify'] for sample in data],
+                "n_samples_per_prompt": n_samples_per_prompt,
+            }
+        }
+    else:
+        print(f"Dataset: {name}, Avg score: {sum([sample.reward['score'] for sample in data]) / len(data)}", flush=True)
     return {
-        dataset_cfg.name: result_dict
+        dataset_cfg.name: {
+            "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
+            "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
+            "samples": data,
+            "n_samples_per_prompt": n_samples_per_prompt,
+        }
     }
 
 

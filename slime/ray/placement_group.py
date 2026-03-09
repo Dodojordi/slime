@@ -73,6 +73,16 @@ def _create_placement_group(num_gpus):
 
 def create_placement_groups(args):
     """Create placement groups for actor and rollout engines."""
+    
+    # 为 critic2 参数设置回退逻辑，如果未指定则使用 critic 的值
+    if args.use_critic2:
+        if not hasattr(args, 'critic2_num_nodes') or args.critic2_num_nodes is None:
+            args.critic2_num_nodes = args.critic_num_nodes if args.use_critic else 1
+            logger.info(f"critic2_num_nodes not specified, falling back to {args.critic_num_nodes}")
+        
+        if not hasattr(args, 'critic2_num_gpus_per_node') or args.critic2_num_gpus_per_node is None:
+            args.critic2_num_gpus_per_node = args.critic_num_gpus_per_node if args.use_critic else args.actor_num_gpus_per_node
+            logger.info(f"critic2_num_gpus_per_node not specified, falling back to {args.critic_num_gpus_per_node}")
 
     num_gpus = 0
     if args.debug_train_only:
@@ -81,15 +91,30 @@ def create_placement_groups(args):
         if args.use_critic:
             num_gpus += args.critic_num_nodes * args.critic_num_gpus_per_node
             critic_offset = args.actor_num_nodes * args.actor_num_gpus_per_node
+        # 添加：第二个 critic
+        if args.use_critic2:
+            num_gpus += args.critic2_num_nodes * args.critic2_num_gpus_per_node
+            critic2_offset = args.actor_num_nodes * args.actor_num_gpus_per_node
+            if args.use_critic:
+                critic2_offset += args.critic_num_nodes * args.critic_num_gpus_per_node
+                
     elif args.debug_rollout_only:
         num_gpus = args.rollout_num_gpus
         rollout_offset = 0
+        
     elif args.colocate:
         num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
         rollout_offset = 0
         if args.use_critic:
             num_gpus += args.critic_num_nodes * args.critic_num_gpus_per_node
             critic_offset = args.actor_num_nodes * args.actor_num_gpus_per_node
+        # 添加：第二个 critic
+        if args.use_critic2:
+            num_gpus += args.critic2_num_nodes * args.critic2_num_gpus_per_node
+            critic2_offset = args.actor_num_nodes * args.actor_num_gpus_per_node
+            if args.use_critic:
+                critic2_offset += args.critic_num_nodes * args.critic_num_gpus_per_node
+                
     else:
         num_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node + args.rollout_num_gpus
         rollout_offset = args.actor_num_nodes * args.actor_num_gpus_per_node
@@ -97,6 +122,13 @@ def create_placement_groups(args):
             num_gpus += args.critic_num_nodes * args.critic_num_gpus_per_node
             critic_offset = args.actor_num_nodes * args.actor_num_gpus_per_node
             rollout_offset += args.critic_num_nodes * args.critic_num_gpus_per_node
+        # 添加：第二个 critic
+        if args.use_critic2:
+            num_gpus += args.critic2_num_nodes * args.critic2_num_gpus_per_node
+            critic2_offset = args.actor_num_nodes * args.actor_num_gpus_per_node
+            if args.use_critic:
+                critic2_offset += args.critic_num_nodes * args.critic_num_gpus_per_node
+            rollout_offset += args.critic2_num_nodes * args.critic2_num_gpus_per_node
 
     logger.info(f"Creating placement group with {num_gpus} GPUs...")
     pg, actor_pg_reordered_bundle_indices = _create_placement_group(num_gpus)
@@ -104,10 +136,14 @@ def create_placement_groups(args):
     rollout_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[rollout_offset:]
     if args.use_critic:
         critic_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[critic_offset:]
+    # 添加：第二个 critic 的 placement group
+    if args.use_critic2:
+        critic2_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[critic2_offset:]
 
     return {
         "actor": (pg, actor_pg_reordered_bundle_indices),
         "critic": (pg, critic_pg_reordered_bundle_indices) if args.use_critic else None,
+        "critic2": (pg, critic2_pg_reordered_bundle_indices) if args.use_critic2 else None,
         "rollout": (pg, rollout_pg_reordered_bundle_indices),
     }
 
@@ -129,6 +165,7 @@ def create_training_models(args, pgs, rollout_manager):
         num_gpus_per_node=args.actor_num_gpus_per_node,
         pg=pgs["actor"],
     )
+    
     if args.use_critic:
         critic_model = allocate_train_group(
             args=args,
@@ -139,6 +176,18 @@ def create_training_models(args, pgs, rollout_manager):
         critic_init_handle = critic_model.async_init(args, role="critic", with_ref=False)
     else:
         critic_model = None
+    
+    # 添加：创建第二个 critic
+    if args.use_critic2:
+        critic_model2 = allocate_train_group(
+            args=args,
+            num_nodes=args.critic2_num_nodes,
+            num_gpus_per_node=args.critic2_num_gpus_per_node,
+            pg=pgs["critic2"],
+        )
+        critic2_init_handle = critic_model2.async_init(args, role="critic2", with_ref=False)
+    else:
+        critic_model2 = None
 
     start_rollout_ids = ray.get(
         actor_model.async_init(args, role="actor", with_ref=args.kl_coef != 0 or args.use_kl_loss)
@@ -151,13 +200,18 @@ def create_training_models(args, pgs, rollout_manager):
     if args.use_critic:
         ray.get(critic_init_handle)
         actor_model.connect(critic_model)
+    
+    # 添加：连接第二个 critic
+    if args.use_critic2:
+        ray.get(critic2_init_handle)
+        actor_model.connect_critic2(critic_model2)
 
     actor_model.set_rollout_manager(rollout_manager)
     if args.rollout_global_dataset:
         ray.get(rollout_manager.load.remote(args.start_rollout_id - 1))
 
-    return actor_model, critic_model
-
+    # 修改：返回三个模型
+    return actor_model, critic_model, critic_model2
 
 def create_rollout_manager(args, pg):
     rollout_manager = RolloutManager.options(

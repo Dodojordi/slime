@@ -24,24 +24,39 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 EXP_NAME="${EXP_NAME:-exp_$(date +%Y%m%d_%H%M%S)}"
 # EXP_NAME="verify_lambd_adaptive_0.05"
-# EXP_NAME="1_7BCritic+WARMUP+32*4"  # Single critic
-EXP_NAME="ADEBUG-4bsftv2_doublecritic1.7b-32*4-64k-utd2-xverify"  # Double critic configuration
-# EXP_NAME="?????"
+EXP_NAME="Debug"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-# source "${SCRIPT_DIR}/models/qwen3-4B.sh"
-SAVE_DIR="/mnt/shared-storage-user/p1-shared/liyizhuo/share/save/P1_PPO/Qwen3-1_7B-Base-${EXP_NAME}/"
+source "${SCRIPT_DIR}/models/qwen3-4B.sh"
+SAVE_DIR="/mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-4B-Base-${EXP_NAME}/"
 CRITIC_SAVE_DIR="${SAVE_DIR}/critic"
-CRITIC2_SAVE_DIR="${SAVE_DIR}/critic2"
-TP_SIZE=2
-PP_SIZE=1
-CP_SIZE=1
-EP_SIZE=1
-ETP_SIZE=1
-MAX_LEN=$((1024 * 40))
-MAX_TOKENS_PER_GPU=$((($MAX_LEN / $CP_SIZE) + 1024))
-ROLLOUT_BATCH_SIZE=32
-N_SAMPLES_PER_PROMPT=4
-NUM_STEPS_PER_ROLLOUT=2
+
+# CKPT_ARGS=(
+#    --hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-4B-Base
+#    # --hf-checkpoint /mnt/shared-storage-user/p1-shared/liyizhuo/share/models/Qwen3-4B
+#    #--hf-checkpoint /root/Qwen3-4B-FP8
+#    # --ref-load /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-4B-Base
+#    --ref-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-4B-Base-CP+BCLR+WARMUP_2steps
+#    --load /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-4B-Base
+#    --save ${SAVE_DIR}
+
+#    --critic-hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-4B-Base
+#    --critic-ref-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-4B-Base-CP+BCLR+WARMUP_2steps/critic
+#    --critic-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-4B-Base-CP+BCLR+WARMUP_2steps/critic
+#    --critic-save ${CRITIC_SAVE_DIR}
+   
+#    --save-interval 100
+# )
+# ==================== RESUME TRAINING CONFIGURATION ====================
+# Checkpoint paths for resuming training
+# To resume from a checkpoint, set RESUME_CHECKPOINT_DIR and RESUME_ROLLOUT_ID
+# Note: RESUME_CHECKPOINT_DIR should point to the checkpoint directory
+# Example: Resume from iter_0000059 (rollout 59) -> start from rollout 60
+# RESUME_CHECKPOINT_DIR="/mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-4B-Base-CP+BCLR+WARMUP_2steps"
+# RESUME_CRITIC_CHECKPOINT_DIR="/mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-4B-Base-CP+BCLR+WARMUP_2steps/critic"
+# RESUME_ROLLOUT_ID=100  # Start from rollout 100 (checkpoint is at iteration 99)
+# # RESUME_CHECKPOINT_DIR=""
+# RESUME_CRITIC_CHECKPOINT_DIR=""
+# RESUME_ROLLOUT_ID=0
 
 # Check if resume checkpoint exists
 if [ -n "$RESUME_CHECKPOINT_DIR" ] && [ -d "$RESUME_CHECKPOINT_DIR" ]; then
@@ -73,111 +88,82 @@ if [ "$USE_RESUME_CHECKPOINT" = true ] && [ -n "$RESUME_CRITIC_CHECKPOINT_DIR" ]
 else
     USE_RESUME_CRITIC_CHECKPOINT=false
 fi
-
-# Check critic2 checkpoint if resume is enabled
-if [ "$USE_RESUME_CHECKPOINT" = true ] && [ -n "$RESUME_CRITIC2_CHECKPOINT_DIR" ] && [ -d "$RESUME_CRITIC2_CHECKPOINT_DIR" ]; then
-    echo "✅ Found resume critic2 checkpoint at: ${RESUME_CRITIC2_CHECKPOINT_DIR}"
-    USE_RESUME_CRITIC2_CHECKPOINT=true
-else
-    USE_RESUME_CRITIC2_CHECKPOINT=false
-fi
 # ========================================================================
 
 # Set checkpoint arguments based on resume status
 if [ "$USE_RESUME_CHECKPOINT" = true ]; then
     CKPT_ARGS=(
        --hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-4B-Base
-       --ref-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/models/Qwen3-4B-Base-torch_dist
+       --ref-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-4B-Base
        --load ${RESUME_CHECKPOINT_DIR}
        --start-rollout-id ${RESUME_ROLLOUT_ID}
        --save ${RESUME_CHECKPOINT_DIR}
        
-       --critic-hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-1.7B-Base
-       --critic-ref-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-1_7B-Base-17B_CriticPretrain/critic
+       --critic-hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-4B-Base
+       $(if [ "$USE_RESUME_CRITIC_CHECKPOINT" = true ]; then echo "--critic-ref-load ${RESUME_CRITIC_CHECKPOINT_DIR}"; fi)
        $(if [ "$USE_RESUME_CRITIC_CHECKPOINT" = true ]; then echo "--critic-load ${RESUME_CRITIC_CHECKPOINT_DIR}"; fi)
        --critic-save ${CRITIC_SAVE_DIR}
        
-       # Critic2 configuration (second critic model)
-       --use-critic2
-       --critic2-hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-1.7B-Base
-       --critic2-ref-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-1_7B-Base-17B_CriticPretrain/critic2
-       $(if [ "$USE_RESUME_CRITIC2_CHECKPOINT" = true ]; then echo "--critic2-load ${RESUME_CRITIC2_CHECKPOINT_DIR}"; fi)
-       --critic2-save ${CRITIC2_SAVE_DIR}
-       
-       --save-interval 500
+       --save-interval 100
     )
 else
     CKPT_ARGS=(
-       --hf-checkpoint /mnt/shared-storage-user/p1-shared/lichenxi1/Qwen3-4B-Thinking-2507-SFT-v2
+       --hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-4B-Base
        # --hf-checkpoint /mnt/shared-storage-user/p1-shared/liyizhuo/share/models/Qwen3-4B
        #--hf-checkpoint /root/Qwen3-4B-FP8
        # --ref-load /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-4B-Base
-       --ref-load /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-4B-Thinking-2507-SFT-v2_torch_dist
-       --load /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-4B-Thinking-2507-SFT-v2_torch_dist
+       --ref-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/models/Qwen3-4B-Base-torch_dist
+       --load /mnt/shared-storage-user/p1-shared/liyizhuo/share/models/Qwen3-4B-Base-torch_dist
        --save ${SAVE_DIR}
 
-       --critic-hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-1.7B-Base
-       --critic-ref-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-1_7B-Base-17B_CriticPretrain/critic
-       --critic-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-1_7B-Base-17B_CriticPretrain/critic
+       --critic-hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-4B-Base
+       --critic-ref-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-4B-Base-slime_PPO_CriticPretrain/critic
+       --critic-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-4B-Base-slime_PPO_CriticPretrain/critic
        --critic-save ${CRITIC_SAVE_DIR}
        
-       # Critic2 configuration (second critic model)
-       --use-critic2
-       --critic2-hf-checkpoint /mnt/shared-storage-user/p1-shared/Qwen/Qwen3-1.7B-Base
-       --critic2-ref-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-1_7B-Base-17B_CriticPretrain/critic
-       --critic2-load /mnt/shared-storage-user/p1-shared/liyizhuo/share/save/Qwen3-1_7B-Base-17B_CriticPretrain/critic
-       --critic2-save ${CRITIC2_SAVE_DIR}
-       
-       --save-interval 1000
+       --save-interval 100
     )
 fi
 
 ROLLOUT_ARGS=(
-#    --prompt-data /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/debug2.jsonl
-   # --prompt-data /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/DAPO-Math-17k/dapo-math-17k.jsonl
-   # --prompt-data proofdata /mnt/shared-storage-user/p1-shared/chenjiacheng/data/imo/train_math_data_with_marking_7pt_valid.jsonl math1205 /mnt/shared-storage-user/p1-shared/chenjiacheng/data/imo/train_math_data_verifiable_1205_processed_v3.jsonl
-   --prompt-data /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/P1/merge.jsonl
+   # --prompt-data /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/debug2.jsonl
+   --prompt-data /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/DAPO-Math-17k/dapo-math-17k.jsonl
    --input-key prompt
    --label-key label
    --apply-chat-template
    --rollout-shuffle
-   --rm-type remote_rm
-   --rm-url "http://10.102.203.45:8021/"
+   --rm-type dapo
    --reward-key score
    
-   --num-rollout 6000
-   --rollout-batch-size $ROLLOUT_BATCH_SIZE
-   --n-samples-per-prompt $N_SAMPLES_PER_PROMPT
-   --rollout-max-response-len $MAX_LEN
-   --rollout-temperature 1.0
+   --num-rollout 1000
+   --rollout-batch-size 16
+   --n-samples-per-prompt 8
+   --rollout-max-response-len 16384
+   --rollout-temperature 0.8
 
-   # --global-batch-size 128
-   --num-steps-per-rollout $NUM_STEPS_PER_ROLLOUT
-   --use-tis
-   --partial-rollout
-   --over-sampling-batch-size $((ROLLOUT_BATCH_SIZE * 2))
+   --global-batch-size 128
    --balance-data
-   --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
 )
-N_SAMPLES_PER_EVAL=(4 1 4)
-IMO_PATH=/mnt/shared-storage-user/p1-shared/zhaoyufeng/eval_results/test_jsonl
+
 EVAL_ARGS=(
-   --eval-interval 4
-   --eval-prompt-data amo $IMO_PATH/amobench.jsonl answerbench $IMO_PATH/answerbench.jsonl proofbench /mnt/shared-storage-user/p1-shared/chenjiacheng/data/imo/proofbench.jsonl
-   --n-samples-per-eval-prompt ${N_SAMPLES_PER_EVAL[@]}
-   --eval-max-response-len 81920
+   --eval-interval 10
+   # --eval-prompt-data aime24 /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/aime_2024/aime-2024-deepmathformat.jsonl aime25 /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/aime-2025/aime-2025-deepmathformat.jsonl
+   # --eval-prompt-data aime24 /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/aime_2024/aime-2024-deepmathformat.jsonl
+   --eval-prompt-data aime24 /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/aime_2024/aime-2024-deepmathformat.jsonl aime25 /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/aime-2025/aime-2025-deepmathformat.jsonl math500 /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/MATH-500/test-deepmathformat.jsonl  minervamath /mnt/shared-storage-user/p1-shared/liyizhuo/share/data/minervamath/test-deepmathformat.jsonl
+   --n-samples-per-eval-prompt 8
+   --eval-max-response-len 16384
    --eval-top-p 0.95
-   --eval-temperature 1.0
+   --eval-temperature 0.6
    --log-passrate
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size $TP_SIZE
+   --tensor-model-parallel-size 1
    --sequence-parallel
-   --pipeline-model-parallel-size $PP_SIZE
-   --context-parallel-size $CP_SIZE
-   # --expert-model-parallel-size $EP_SIZE
-   # --expert-tensor-parallel-size $ETP_SIZE
+   --pipeline-model-parallel-size 1
+   --context-parallel-size 1
+   --expert-model-parallel-size 1
+   --expert-tensor-parallel-size 1
 
    --recompute-granularity full
    --recompute-method uniform
@@ -185,11 +171,7 @@ PERF_ARGS=(
 
    # --micro-batch-size 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu $MAX_TOKENS_PER_GPU
-   --transformer-impl transformer_engine
-   --bf16
-   --fp8-format e4m3
-   --fp8-recipe blockwise
+   --max-tokens-per-gpu 10240
 )
 
 # GRPO_ARGS=(
@@ -204,25 +186,17 @@ PERF_ARGS=(
 
 PPO_ARGS=(
    --advantage-estimator ppo
-   # --use-kl-loss
+   --use-kl-loss
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --kl-coef 0.00
-#    --entropy-coef 0.00
+   --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
    --num-critic-only-steps 10
    # --num-critic-only-steps 1
    # --normalize-advantages
-   --critic-lr 4e-6
-   --critic-num-nodes 1
-   --critic-num-gpus-per-node 2
-
-
-   # Critic2 configuration (same settings as critic1)
-   --critic2-num-nodes 1
-   --critic2-num-gpus-per-node 2
-   --critic2-lr 4e-6
+   --critic-lr 2e-6
 )
 
 OPTIMIZER_ARGS=(
@@ -232,10 +206,6 @@ OPTIMIZER_ARGS=(
    --weight-decay 0.1
    --adam-beta1 0.9
    --adam-beta2 0.98
-
-   --optimizer-cpu-offload
-   --overlap-cpu-optimizer-d2h-h2d
-   --use-precision-aware-optimizer
 )
 
 export WANDB_DIR="/mnt/shared-storage-user/p1-shared/liyizhuo/code/slime/wandb"
@@ -254,14 +224,8 @@ WANDB_ARGS=(
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 2
    --sglang-mem-fraction-static 0.7
-   --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
-   --sglang-speculative-algorithm EAGLE3
-   --sglang-speculative-num-steps 3
-   --sglang-speculative-eagle-topk 1
-   --sglang-speculative-num-draft-tokens 4
-   --sglang-speculative-draft-model-path /mnt/shared-storage-user/p1-shared/leihaodi/spec_decode/draft-model/Qwen3-4B-Eagle3-Zjcxy-SmartAI
 )
-export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+
 MISC_ARGS=(
    # default dropout in megatron is 0.1
    --attention-dropout 0.0
@@ -299,34 +263,19 @@ CUSTOM_ARGS=(
    # --use-adaptive-lambda
    # --alpha 0.05
    --log-position-advantage-stats
+   --num-steps-per-rollout 1
    # --use-positive-nll-loss
-#    --positive-nll-coef 0.1
-#    --positive-reward-threshold 0.0
-   # --eval-first
+   # --positive-nll-coef 0.1
+   # --positive-reward-threshold 0.0
+   # --calculate-per-token-loss
    --finetune
    --no-load-optim
-   # --use-asytrain-critic
-   # --use-advantage-diff-mask
-   # --advantage-diff-mask-k 0.1
-   # --use-entropy-value-divergence-filter
-   # --entropy-divergence-filter-h 0.2
-   # --entropy-coef 0.001
-#    --critic-num-gpus-per-node 2
-#    --critic-num-nodes 1
-#    --critic2-num-gpus-per-node 2
-#    --critic2-num-nodes 1
-   --eval-use-xverify
-   # --eval-group
-   --log-probs-chunk-size 8192
-   --train-use-xverify
-   # --eval-log-dir ${DEBUG_DIR}/eval
-   # --start-rollout-id 0
+   # --eval-first
 )
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-# 使用 8 GPUs: Actor(2) + Critic1(colocate with actor) + Critic2(2) + Rollout(2-4)
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 6 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=26500
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=26500
 
 # Build the runtime environment JSON with proper variable substitution
 RUNTIME_ENV_JSON="{
@@ -352,16 +301,15 @@ if [ -z "$RANK" ]; then
   export RANK=0
 fi
 
-
-# ${MODEL_ARGS[@]} \
 # ========= Submit Ray Job (rank 0 only) =========
 if [ "$RANK" == "0" ]; then
    ray job submit --address="http://127.0.0.1:26500" \
       --runtime-env-json="${RUNTIME_ENV_JSON}" \
       -- python3 train.py \
       --actor-num-nodes 1 \
-      --actor-num-gpus-per-node 2 \
+      --actor-num-gpus-per-node 4 \
       --colocate \
+      ${MODEL_ARGS[@]} \
       ${CKPT_ARGS[@]} \
       ${ROLLOUT_ARGS[@]} \
       ${OPTIMIZER_ARGS[@]} \
